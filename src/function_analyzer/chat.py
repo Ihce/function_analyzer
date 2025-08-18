@@ -9,7 +9,7 @@ from .agent import BinaryAnalysisAgent
 
 
 # Enhanced system prompt that explicitly guides tool usage
-SYSTEM_PROMPT = """You are a reverse-engineering assistant specialized in binary analysis.
+SYSTEM_PROMPT = """You are a reverse-engineering assistant specialized in binary analysis. Your goal is to help the user answer questions. Try not to over explain or over engineer the response.
 
 You have access to THREE tools that you MUST use in sequence to analyze binary files:
 

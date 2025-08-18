@@ -148,21 +148,24 @@ class BinaryAnalysisAgent:
         return json.dumps(success_msg)
 
     def _ensure_boundary_model(self, model_path: Optional[str]) -> Optional[str]:
-        if self._boundary_loaded:
-            return None
-        ckpt = model_path or self.boundary_ckpt
-        if not ckpt:
-            ckpt = "models/function_boundary.pth"
-            return "Boundary model checkpoint was not provided."
+        # Always allow an explicit model_path to (re)load, even if one was loaded before
+        ckpt = model_path or self.boundary_ckpt or "/hdd/dylan/function_analyzer/models/function_boundary.pth"
         try:
-            self.log.info(f"[MODEL] Loading boundary detector model: {ckpt}")
-            self.boundaries.load_model(ckpt)
-            self._boundary_loaded = True
+            if not self._boundary_loaded or (model_path is not None):
+                self.log.info(f"[MODEL] Loading boundary detector model: {ckpt}")
+                self.boundaries.load_model(ckpt)
+                self._boundary_loaded = True
             return None
         except Exception as e:
             return f"Failed to load boundary model: {e}"
 
-    def _call_boundary_detector(self, *, model_path: Optional[str] = None) -> str:
+
+    def _call_boundary_detector(
+        self,
+        *,
+        model_path: Optional[str] = None,
+        **kwargs: Any,   # <-- accept min_function_size, merge_distance, resolve_overlaps, stride
+    ) -> str:
         self.log.info(f"[TOOL EXEC] boundary_detector")
 
         if not self.state.get("binary") or not self.state["binary"].get("success"):
@@ -175,9 +178,41 @@ class BinaryAnalysisAgent:
             self.log.error(f"[TOOL RESULT] boundary_detector failed: {maybe_err}")
             return json.dumps({"error": maybe_err})
 
-        text = self.state["binary"]["text_array"]
+        # Forward runtime knobs to the tool (parity with infer.py defaults)
+        if "stride" in kwargs and kwargs["stride"] is not None:
+            try:
+                self.boundaries.stride = int(kwargs["stride"])
+            except Exception:
+                pass
+        if "min_function_size" in kwargs and kwargs["min_function_size"] is not None:
+            try:
+                self.boundaries.min_function_size = int(kwargs["min_function_size"])
+            except Exception:
+                pass
+        if "merge_distance" in kwargs and kwargs["merge_distance"] is not None:
+            try:
+                self.boundaries.merge_distance = int(kwargs["merge_distance"])
+            except Exception:
+                pass
+        if "resolve_overlaps" in kwargs and kwargs["resolve_overlaps"] is not None:
+            try:
+                self.boundaries.resolve_overlaps = bool(kwargs["resolve_overlaps"])
+            except Exception:
+                pass
+
+        # Prepare inputs
+        import numpy as np
+        text = np.asarray(self.state["binary"]["text_array"], dtype=np.uint8)
         base = int(self.state["binary"]["base_address"])
-        self.log.debug(f"Running boundary detection on {len(text)} bytes, base=0x{base:08X}")
+
+        # Log config used (helps explain any future mismatches)
+        self.log.debug(
+            f"Running boundary detection on {len(text)} bytes, base=0x{base:08X}, "
+            f"window_size={self.boundaries.window_size}, stride={self.boundaries.stride}, "
+            f"min_size={getattr(self.boundaries, 'min_function_size', 'n/a')}, "
+            f"resolve_overlaps={getattr(self.boundaries, 'resolve_overlaps', 'n/a')}, "
+            f"merge_distance={getattr(self.boundaries, 'merge_distance', 'n/a')}"
+        )
 
         result = self.boundaries.run(text, base)
         if not result.get("success"):
@@ -189,13 +224,10 @@ class BinaryAnalysisAgent:
         self.state["functions"] = funcs
         count = int(result.get("total_functions", len(funcs)))
 
-        # Log detailed function boundaries
         self.log.info("="*60)
         self.log.info(f"[BOUNDARY DETECTOR RESULTS]")
         self.log.info(f"  Total functions detected: {count}")
         self.log.info("-"*60)
-
-        # Log first 20 functions in detail, then summary for rest
         for i, func in enumerate(funcs[:20]):
             self.log.info(f"  Function #{i+1}:")
             self.log.info(f"    Type: {func.get('type', 'unknown')}")
@@ -203,13 +235,10 @@ class BinaryAnalysisAgent:
             self.log.info(f"    Start Offset: 0x{func.get('start_offset', 0):08X}")
             self.log.info(f"    End Offset: 0x{func.get('end_offset', 0):08X}")
             self.log.info(f"    Size: {func.get('size', 0)} bytes")
-
         if len(funcs) > 20:
             self.log.info(f"  ... and {len(funcs) - 20} more functions")
-
         self.log.info("="*60)
 
-        # Dump full function list to debug log
         if self.verbose:
             self.log.debug("[FULL FUNCTION LIST]")
             self.log.debug(json.dumps(funcs, indent=2))
@@ -221,6 +250,7 @@ class BinaryAnalysisAgent:
             "examples": examples,
         }
         return json.dumps(success_msg)
+
 
     def _call_disassembler(self) -> str:
         self.log.info(f"[TOOL EXEC] disassembler")
