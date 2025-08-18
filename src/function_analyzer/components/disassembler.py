@@ -3,6 +3,15 @@
 import capstone
 from typing import Dict, Any, List
 
+# ✨ Pydantic (self-describing tool schema)
+from pydantic import BaseModel
+
+
+# ✨ Args model for function-calling (no args needed for this tool)
+class DisassemblerArgs(BaseModel):
+    # Intentionally empty — agent supplies state (text_array, functions, base_address, arch)
+    pass
+
 
 class DisassemblerTool:
     """Disassemble functions using Capstone."""
@@ -12,6 +21,23 @@ class DisassemblerTool:
     Input: text_array, functions list, architecture
     Output: disassembled instructions for each function
     Use this after detecting function boundaries to see the actual assembly code."""
+
+    # ✨ Tell the agent what args this tool expects
+    ArgsModel = DisassemblerArgs
+
+    @classmethod
+    def tool_spec(cls) -> Dict[str, Any]:
+        """Return OpenAI/Ollama function-calling schema generated from Pydantic."""
+        try:
+            params = cls.ArgsModel.model_json_schema()  # Pydantic v2
+        except AttributeError:
+            params = cls.ArgsModel.schema()             # Pydantic v1 fallback
+        params.setdefault("additionalProperties", False)
+        return {
+            "name": cls.name,
+            "description": cls.description.strip(),
+            "parameters": params,
+        }
 
     def __init__(self):
         self.cs_cache = {}

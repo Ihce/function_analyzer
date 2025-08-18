@@ -4,8 +4,11 @@ import torch
 import torch.nn as nn
 import numpy as np
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from mamba_ssm import Mamba
+
+# ✨ Pydantic (self-describing tool schema)
+from pydantic import BaseModel, Field
 
 
 class MambaBlock(nn.Module):
@@ -40,6 +43,14 @@ class FunctionBoundaryModel(nn.Module):
         return self.output_proj(x)
 
 
+# ✨ Args model for function-calling (optional model_path override)
+class BoundaryDetectorArgs(BaseModel):
+    model_path: Optional[str] = Field(
+        default=None,
+        description="Optional checkpoint override for the boundary model.",
+    )
+
+
 class BoundaryDetectorTool:
     """Detect function boundaries using trained Mamba model."""
 
@@ -48,6 +59,23 @@ class BoundaryDetectorTool:
     Input: text_array from binary_loader, model_path
     Output: list of detected functions with start/end offsets
     Use this after loading the binary to find where functions are."""
+
+    # ✨ Tell the agent what args this tool expects
+    ArgsModel = BoundaryDetectorArgs
+
+    @classmethod
+    def tool_spec(cls) -> Dict[str, Any]:
+        """Return OpenAI/Ollama function-calling schema generated from Pydantic."""
+        try:
+            params = cls.ArgsModel.model_json_schema()  # Pydantic v2
+        except AttributeError:
+            params = cls.ArgsModel.schema()             # Pydantic v1 fallback
+        params.setdefault("additionalProperties", False)
+        return {
+            "name": cls.name,
+            "description": cls.description.strip(),
+            "parameters": params,
+        }
 
     def __init__(self, model_path: str = None):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

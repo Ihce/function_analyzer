@@ -5,15 +5,37 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, Any
 
+# ✨ Pydantic (self-describing tool schema)
+from pydantic import BaseModel, Field
+
+
+class BinaryLoaderArgs(BaseModel):
+    file_path: str = Field(..., min_length=1, description="Path to the PE file on disk.")
+
 
 class BinaryLoaderTool:
-    """Extract .text section from PE files."""
-
     name = "binary_loader"
     description = """Loads a PE binary file and extracts the .text section.
     Input: path to PE file
     Output: dictionary with text_array, base_address, and metadata
     Use this first to load any binary file."""
+
+    ArgsModel = BinaryLoaderArgs
+
+    @classmethod
+    def tool_spec(cls) -> Dict[str, Any]:
+        """Return OpenAI/Ollama function-calling schema generated from Pydantic."""
+        try:
+            params = cls.ArgsModel.model_json_schema()  # Pydantic v2
+        except AttributeError:
+            params = cls.ArgsModel.schema()             # Pydantic v1 fallback
+        # Be strict about extra args
+        params.setdefault("additionalProperties", False)
+        return {
+            "name": cls.name,
+            "description": cls.description.strip(),
+            "parameters": params,
+        }
 
     def __init__(self):
         self.last_result = None
