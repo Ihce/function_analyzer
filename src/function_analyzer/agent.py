@@ -131,13 +131,24 @@ class BinaryAnalysisAgent:
         base = int(result.get("base_address", 0))
         size = int(result.get("text_size", 0))
 
+        # Log detailed binary info
+        self.log.info("="*60)
+        self.log.info("[BINARY LOADER RESULTS]")
+        self.log.info(f"  File: {result.get('file_path')}")
+        self.log.info(f"  Architecture: {arch}")
+        self.log.info(f"  Base Address: 0x{base:08X}")
+        self.log.info(f"  Image Base: 0x{result.get('image_base', 0):08X}")
+        self.log.info(f"  Section RVA: 0x{result.get('section_rva', 0):08X}")
+        self.log.info(f"  Text Size: {size} bytes")
+        self.log.info(f"  Is 64-bit: {result.get('is_64bit')}")
+        self.log.info("="*60)
+
         success_msg = {
             "summary": "Loaded .text successfully.",
             "arch": arch,
             "base_address": f"0x{base:08X}",
             "text_size": size,
         }
-        self.log.info(f"[TOOL RESULT] binary_loader success: {success_msg}")
         return json.dumps(success_msg)
 
     def _ensure_boundary_model(self, model_path: Optional[str]) -> Optional[str]:
@@ -180,14 +191,38 @@ class BinaryAnalysisAgent:
         funcs = result.get("functions", [])
         self.state["functions"] = funcs
         count = int(result.get("total_functions", len(funcs)))
-        examples = [hex(f.get("start_address", 0)) for f in funcs[:3]]
 
+        # Log detailed function boundaries
+        self.log.info("="*60)
+        self.log.info(f"[BOUNDARY DETECTOR RESULTS]")
+        self.log.info(f"  Total functions detected: {count}")
+        self.log.info("-"*60)
+
+        # Log first 20 functions in detail, then summary for rest
+        for i, func in enumerate(funcs[:20]):
+            self.log.info(f"  Function #{i+1}:")
+            self.log.info(f"    Type: {func.get('type', 'unknown')}")
+            self.log.info(f"    Start Address: 0x{func.get('start_address', 0):08X}")
+            self.log.info(f"    Start Offset: 0x{func.get('start_offset', 0):08X}")
+            self.log.info(f"    End Offset: 0x{func.get('end_offset', 0):08X}")
+            self.log.info(f"    Size: {func.get('size', 0)} bytes")
+
+        if len(funcs) > 20:
+            self.log.info(f"  ... and {len(funcs) - 20} more functions")
+
+        self.log.info("="*60)
+
+        # Dump full function list to debug log
+        if self.verbose:
+            self.log.debug("[FULL FUNCTION LIST]")
+            self.log.debug(json.dumps(funcs, indent=2))
+
+        examples = [hex(f.get("start_address", 0)) for f in funcs[:3]]
         success_msg = {
             "summary": f"Detected {count} functions.",
             "count": count,
             "examples": examples,
         }
-        self.log.info(f"[TOOL RESULT] boundary_detector success: {success_msg}")
         return json.dumps(success_msg)
 
     def _call_disassembler(self) -> str:
@@ -215,6 +250,45 @@ class BinaryAnalysisAgent:
         self.state["disassembly"] = disassembled
         n = int(result.get("total_functions", len(disassembled)))
 
+        # Log detailed disassembly results
+        self.log.info("="*60)
+        self.log.info(f"[DISASSEMBLER RESULTS]")
+        self.log.info(f"  Total functions disassembled: {n}")
+        self.log.info("-"*60)
+
+        # Log first 5 functions' disassembly in detail
+        for i, func_data in enumerate(disassembled[:5]):
+            func_info = func_data.get("function", {})
+            instructions = func_data.get("instructions", [])
+            preview = func_data.get("disassembly_preview", "")
+
+            self.log.info(f"  Function #{i+1}:")
+            self.log.info(f"    Start Address: 0x{func_info.get('start_address', 0):08X}")
+            self.log.info(f"    Size: {func_info.get('size', 0)} bytes")
+            self.log.info(f"    Instruction Count: {func_data.get('instruction_count', 0)}")
+            self.log.info(f"    First 20 instructions:")
+
+            # Log the preview (already formatted)
+            for line in preview.split('\n')[:20]:
+                if line.strip():
+                    self.log.info(f"      {line}")
+
+        if len(disassembled) > 5:
+            self.log.info(f"  ... and {len(disassembled) - 5} more functions")
+
+        self.log.info("="*60)
+
+        # Dump full disassembly to debug log (be careful with large files)
+        if self.verbose and len(disassembled) <= 50:  # Only dump if not too many functions
+            self.log.debug("[FULL DISASSEMBLY DUMP - First 50 functions]")
+            for i, func_data in enumerate(disassembled[:50]):
+                self.log.debug(f"Function {i+1}:")
+                self.log.debug(json.dumps({
+                    "function": func_data.get("function"),
+                    "instruction_count": func_data.get("instruction_count"),
+                    "first_10_instructions": func_data.get("instructions", [])[:10]
+                }, indent=2))
+
         example_preview = None
         if disassembled:
             f0 = disassembled[0]
@@ -227,7 +301,6 @@ class BinaryAnalysisAgent:
             "total": n,
             "example": example_preview,
         }
-        self.log.info(f"[TOOL RESULT] disassembler success: Found {n} functions")
         return json.dumps(success_msg)
 
     # ---------- Agent loop ----------

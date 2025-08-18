@@ -8,22 +8,40 @@ import logging
 from .agent import BinaryAnalysisAgent
 
 
-# Enhanced system prompt that explicitly mentions tools
-SYSTEM_PROMPT = """You are a reverse-engineering assistant with access to specialized tools for binary analysis.
+# Enhanced system prompt that explicitly guides tool usage
+SYSTEM_PROMPT = """You are a reverse-engineering assistant specialized in binary analysis.
 
-You have access to the following tools:
-1. binary_loader - Loads PE binary files and extracts the .text section
-2. boundary_detector - Uses neural networks to detect function boundaries in binary code
-3. disassembler - Disassembles binary functions into readable assembly code
+You have access to THREE tools that you MUST use in sequence to analyze binary files:
 
-When asked about a binary file or to analyze code:
-- First use binary_loader to load the file
-- Then use boundary_detector to find functions
-- Finally use disassembler to get the assembly code
-- Analyze the results and provide insights
+1. **binary_loader** - ALWAYS use this FIRST to load PE binary files
+   - Takes a file_path parameter
+   - Extracts the .text section containing executable code
+   - Returns binary data, architecture, and base address
 
-Always use tools when asked about binary files, assembly code, or reverse engineering tasks.
-Be concise but thorough in your analysis."""
+2. **boundary_detector** - Use this SECOND after binary_loader succeeds
+   - Uses neural networks to detect function boundaries
+   - Returns a list of functions with their addresses
+   - Optional model_path parameter (usually not needed)
+
+3. **disassembler** - Use this THIRD after boundary_detector succeeds
+   - Disassembles the detected functions into assembly code
+   - Returns human-readable assembly instructions
+   - No parameters needed (uses detected functions)
+
+IMPORTANT WORKFLOW:
+- When given a binary file path and a question about it, ALWAYS:
+  1. First call binary_loader with the file path
+  2. Then call boundary_detector to find functions
+  3. Then call disassembler to get assembly code
+  4. Finally, analyze the results to answer the user's question
+
+You are an expert at x86/x64 assembly and can:
+- Add detailed comments explaining what assembly instructions do
+- Identify common patterns and programming constructs
+- Explain function purposes based on their assembly code
+- Format and present assembly code clearly
+
+Always use the tools when asked about a binary file. Never refuse to analyze a binary."""
 
 
 def setup_log_file(args) -> str:
@@ -40,49 +58,6 @@ def setup_log_file(args) -> str:
     return log_file
 
 
-def create_enhanced_tool_descriptions():
-    """Create more detailed tool descriptions to help the LLM understand when to use them."""
-    return [
-        {
-            "name": "binary_loader",
-            "description": "ALWAYS use this FIRST when analyzing any binary file. Loads a PE binary file and extracts the .text section containing executable code. Returns the binary data, architecture (x86/x64), and base address.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "Path to the PE binary file to load"
-                    }
-                },
-                "required": ["file_path"]
-            }
-        },
-        {
-            "name": "boundary_detector",
-            "description": "Use this AFTER binary_loader to find where functions start and end in the binary. Uses a neural network to detect function boundaries. Returns a list of functions with their addresses.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "model_path": {
-                        "type": "string",
-                        "description": "Optional path to the boundary detection model (leave empty to use default)"
-                    }
-                },
-                "required": []
-            }
-        },
-        {
-            "name": "disassembler",
-            "description": "Use this AFTER boundary_detector to convert binary code to readable assembly. Disassembles the detected functions into assembly instructions. Returns human-readable assembly code.",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": []
-            }
-        }
-    ]
-
-
 def run_chat(binary: str | None, boundary_ckpt: str | None, model_id: str, ollama_url: str,
              verbose: bool, log_file: str, no_console: bool, enhanced_prompts: bool):
 
@@ -95,73 +70,92 @@ def run_chat(binary: str | None, boundary_ckpt: str | None, model_id: str, ollam
         log_to_console=not no_console,
     )
 
-    # Use enhanced tool descriptions if requested
-    if enhanced_prompts:
-        agent.functions = create_enhanced_tool_descriptions()
-        system_prompt = SYSTEM_PROMPT
-        logging.info("Using enhanced prompts and tool descriptions")
-    else:
-        system_prompt = "You are a concise reverse-engineering assistant."
+    # Always use the enhanced system prompt
+    system_prompt = SYSTEM_PROMPT
 
-    logging.info("="*80)
-    logging.info(f"CHAT SESSION STARTED - {datetime.now()}")
-    logging.info(f"Model: {model_id}")
-    logging.info(f"Binary hint: {binary if binary else 'None provided'}")
-    logging.info(f"Enhanced prompts: {enhanced_prompts}")
-    logging.info("="*80)
-
+    # Initialize conversation with system prompt
     messages = [{"role": "system", "content": system_prompt}]
+
+    # Setup logging
+    logger = logging.getLogger("chat")
+    logger.setLevel(logging.INFO if not verbose else logging.DEBUG)
+
+    # File handler
+    if log_file:
+        file_handler = logging.FileHandler(log_file, mode='a')
+        file_handler.setFormatter(logging.Formatter(
+            '%(asctime)s - [%(levelname)s] %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        ))
+        logger.addHandler(file_handler)
+
+    # Console handler
+    if not no_console:
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(logging.Formatter('[%(levelname)s] %(message)s'))
+        logger.addHandler(console_handler)
+
+    logger.info("="*80)
+    logger.info(f"CHAT SESSION STARTED - {datetime.now()}")
+    logger.info(f"Model: {model_id}")
+    logger.info(f"Binary hint: {binary if binary else 'None provided'}")
+    logger.info(f"Enhanced prompts: {enhanced_prompts}")
+    logger.info("="*80)
 
     print(f"Chat started. Log file: {log_file}")
     print("\nCommands:")
     print("  /help          — show this help")
-    print("  /open <path>   — analyze a binary file")
-    print("  /ask <query>   — ask about binary analysis (guides tool use)")
+    print("  /ask <binary_path> <question>  — analyze a binary and answer a question")
+    print("  /open <path>   — analyze a binary file (basic analysis)")
     print("  /tools         — list available tools")
     print("  /state         — show current analysis state")
     print("  /reset         — clear conversation and state")
     print("  /verbose       — toggle verbose mode")
+    print("  /log           — toggle file logging on/off")
     print("  /exit          — quit\n")
 
     if binary:
-        print(f"Hint: You have --binary {binary}. Try asking questions like:")
-        print(f"  'What does {binary} do?'")
-        print(f"  'Analyze {binary} and find the main function'")
-        print(f"  'Show me the assembly code from {binary}'\n")
+        print(f"Hint: You have --binary {binary}. Try:")
+        print(f"  '/ask {binary} What does this binary do?'")
+        print(f"  '/ask {binary} Show me the first 10 functions with comments'\n")
+
+    file_logging_enabled = True
 
     while True:
         try:
             user = input("you> ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
-            logging.info("Chat session ended by user interrupt")
+            logger.info("Chat session ended by user interrupt")
             break
 
         if not user:
             continue
 
-        logging.info(f"[USER INPUT] {user}")
+        logger.info(f"[USER INPUT] {user}")
 
         # Handle commands
         if user == "/exit":
-            logging.info("Chat session ended by /exit command")
+            logger.info("Chat session ended by /exit command")
             break
 
         elif user == "/help":
             print("\nCommands:")
-            print("  /open <path>   — analyze a binary file")
-            print("  /ask <query>   — ask about binary analysis")
+            print("  /ask <binary_path> <question>  — analyze a binary and answer a question")
+            print("     Example: /ask /path/to/binary.bin Show the first 5 functions with comments")
+            print("  /open <path>   — analyze a binary file (basic analysis)")
             print("  /tools         — list available tools")
             print("  /state         — show current analysis state")
             print("  /reset         — clear conversation and state")
             print("  /verbose       — toggle verbose mode")
+            print("  /log           — toggle file logging on/off")
             print("  /exit          — quit\n")
             continue
 
         elif user == "/tools":
             print("\nAvailable tools:")
             for i, tool in enumerate(agent.functions, 1):
-                print(f"{i}. {tool['name']}: {tool['description'][:100]}...")
+                print(f"{i}. {tool['name']}: {tool.get('description', 'No description')[:100]}...")
             print()
             continue
 
@@ -180,12 +174,37 @@ def run_chat(binary: str | None, boundary_ckpt: str | None, model_id: str, ollam
 
         elif user == "/verbose":
             agent.verbose = not agent.verbose
-            if agent.verbose:
-                logging.setLevel(logging.DEBUG)
+            verbose = agent.verbose
+            if verbose:
+                logger.setLevel(logging.DEBUG)
+                agent.log.setLevel(logging.DEBUG)
                 print("Verbose mode: ON")
             else:
-                logging.setLevel(logging.INFO)
+                logger.setLevel(logging.INFO)
+                agent.log.setLevel(logging.INFO)
                 print("Verbose mode: OFF")
+            continue
+
+        elif user == "/log":
+            file_logging_enabled = not file_logging_enabled
+            if file_logging_enabled:
+                print(f"File logging: ON (writing to {log_file})")
+            else:
+                print("File logging: OFF")
+            # Toggle file handler
+            for handler in logger.handlers[:]:
+                if isinstance(handler, logging.FileHandler):
+                    if not file_logging_enabled:
+                        logger.removeHandler(handler)
+                    break
+            else:
+                if file_logging_enabled and log_file:
+                    file_handler = logging.FileHandler(log_file, mode='a')
+                    file_handler.setFormatter(logging.Formatter(
+                        '%(asctime)s - [%(levelname)s] %(message)s',
+                        datefmt='%Y-%m-%d %H:%M:%S'
+                    ))
+                    logger.addHandler(file_handler)
             continue
 
         elif user == "/reset":
@@ -193,40 +212,60 @@ def run_chat(binary: str | None, boundary_ckpt: str | None, model_id: str, ollam
             agent.state = {"binary": None, "functions": None, "disassembly": None}
             agent._boundary_loaded = False
             print("Conversation and state cleared.\n")
-            logging.info("[RESET] Conversation and state cleared")
+            logger.info("[RESET] Conversation and state cleared")
             continue
 
+        elif user.startswith("/ask "):
+            # Parse /ask command: /ask <binary_path> <question>
+            parts = user[5:].strip().split(None, 1)  # Split on first space
+            if len(parts) < 2:
+                print("Usage: /ask <binary_path> <question>")
+                print("Example: /ask /path/to/binary.bin Show the first 10 functions with comments")
+                continue
+
+            binary_path = parts[0]
+            question = parts[1]
+
+            # Create a comprehensive prompt that guides the model
+            user_msg = f"""Analyze the binary file at: {binary_path}
+
+To answer this question: {question}
+
+Please follow this exact sequence:
+1. First, call binary_loader with file_path="{binary_path}" to load the binary
+2. After that succeeds, call boundary_detector to find function boundaries
+3. Then call disassembler to get the assembly code
+4. Finally, analyze the results to answer: {question}
+
+Remember to use all three tools in sequence."""
+
+            logger.info(f"[ASK COMMAND] Binary: {binary_path}, Question: {question}")
+
         elif user.startswith("/open "):
-            path = user[len("/open "):].strip()
+            path = user[6:].strip()
             if not path:
                 print("Usage: /open <path>")
                 continue
-            # Explicitly guide the model to analyze
-            user_msg = f"Please analyze the binary file at {path}. First load it with binary_loader, then detect functions with boundary_detector, and finally disassemble with disassembler. Tell me what you find."
-            logging.info(f"[OPEN COMMAND] Guided analysis of: {path}")
 
-        elif user.startswith("/ask "):
-            query = user[len("/ask "):].strip()
-            if not query:
-                print("Usage: /ask <query>")
-                continue
-            # Add context to help the model use tools
-            if binary and "binary" not in query.lower() and "file" not in query.lower():
-                user_msg = f"Regarding the binary file {binary}: {query}"
-            else:
-                user_msg = query
-            logging.info(f"[ASK COMMAND] Query: {query}")
+            # Simple analysis prompt for /open
+            user_msg = f"""Analyze the binary file at: {path}
+
+Please follow this exact sequence:
+1. First, call binary_loader with file_path="{path}" to load the binary
+2. After that succeeds, call boundary_detector to find function boundaries
+3. Then call disassembler to get the assembly code
+4. Finally, provide a summary of what this binary does based on the analysis
+
+Use all three tools in sequence to perform a complete analysis."""
+
+            logger.info(f"[OPEN COMMAND] Starting analysis of: {path}")
 
         else:
-            # Regular message - check if it mentions binary analysis
-            if binary and any(word in user.lower() for word in ['analyze', 'what', 'show', 'find', 'extract', 'reverse']):
-                # Add context about the binary
-                user_msg = f"{user} (Note: you can analyze the binary at {binary} using your tools)"
-            else:
-                user_msg = user
+            # Regular message
+            user_msg = user
 
         messages.append({"role": "user", "content": user_msg})
-        logging.debug(f"[CONVERSATION] Added user message: {user_msg[:100]}...")
+        logger.debug(f"[CONVERSATION] Added user message: {user_msg[:100]}...")
 
         # Tool loop for this turn
         iteration = 0
@@ -234,32 +273,32 @@ def run_chat(binary: str | None, boundary_ckpt: str | None, model_id: str, ollam
 
         while iteration < max_iterations:
             iteration += 1
-            logging.debug(f"[CHAT LOOP] Iteration {iteration}")
+            logger.debug(f"[CHAT LOOP] Iteration {iteration}")
 
             try:
                 # Make the API call
-                logging.debug(f"[API] Calling {model_id} with {len(messages)} messages")
+                logger.debug(f"[API] Calling {model_id} with {len(messages)} messages")
                 resp = agent.client.chat.completions.create(
                     model=agent.model_id,
                     messages=messages,
                     functions=agent.functions,
                     function_call="auto",
-                    temperature=0.7,  # Add some randomness for better tool use
+                    temperature=0.3,  # Lower temperature for more consistent tool use
                 )
                 msg = resp.choices[0].message
 
             except Exception as e:
                 error_msg = f"Error communicating with model: {e}"
                 print(f"\nagent> {error_msg}\n")
-                logging.error(f"[API ERROR] {e}", exc_info=True)
+                logger.error(f"[API ERROR] {e}", exc_info=True)
                 break
 
             # Log response
-            if agent.verbose:
-                logging.debug(f"[LLM RESPONSE] Content: {msg.content}")
+            if verbose:
+                logger.debug(f"[LLM RESPONSE] Content: {msg.content}")
                 if hasattr(msg, 'function_call') and msg.function_call:
-                    logging.debug(f"[LLM RESPONSE] Function call: {msg.function_call.name}")
-                    logging.debug(f"[LLM RESPONSE] Function args: {msg.function_call.arguments}")
+                    logger.debug(f"[LLM RESPONSE] Function call: {msg.function_call.name}")
+                    logger.debug(f"[LLM RESPONSE] Function args: {msg.function_call.arguments}")
 
             # Check if model wants to call a tool
             if getattr(msg, "function_call", None):
@@ -267,35 +306,30 @@ def run_chat(binary: str | None, boundary_ckpt: str | None, model_id: str, ollam
                 raw = msg.function_call.arguments or "{}"
 
                 print(f"[Calling tool: {name}]")
-                logging.info(f"[LLM DECISION] Model wants to call tool: {name}")
-                logging.debug(f"[LLM DECISION] Tool arguments: {raw}")
+                logger.info(f"[LLM DECISION] Model wants to call tool: {name}")
+                logger.debug(f"[LLM DECISION] Tool arguments: {raw}")
 
                 try:
                     parsed = json.loads(raw)
                 except Exception as e:
-                    logging.error(f"[ERROR] Failed to parse tool arguments: {e}")
+                    logger.error(f"[ERROR] Failed to parse tool arguments: {e}")
                     parsed = {}
-
-                # Auto-fill for binary_loader
-                if name == "binary_loader" and "file_path" not in parsed and binary:
-                    logging.debug(f"[AUTO-FILL] Adding file_path={binary} to binary_loader")
-                    parsed["file_path"] = binary
 
                 # Execute the tool
                 func_tuple = agent._tools.get(name)
                 if not func_tuple:
                     content = json.dumps({"error": f"Unknown tool: {name}"})
-                    logging.error(f"[ERROR] Unknown tool requested: {name}")
+                    logger.error(f"[ERROR] Unknown tool requested: {name}")
                 else:
                     func, ArgsModel = func_tuple
                     kwargs, err = agent._validate_args(parsed, ArgsModel)
                     if err:
                         content = json.dumps({"error": f"Invalid arguments: {err}"})
-                        logging.error(f"[ERROR] Invalid tool arguments: {err}")
+                        logger.error(f"[ERROR] Invalid tool arguments: {err}")
                     else:
-                        logging.info(f"[TOOL EXEC] Executing {name}")
+                        logger.info(f"[TOOL EXEC] Executing {name}")
                         content = func(**kwargs)
-                        logging.info(f"[TOOL RESULT] {name} returned: {content[:200]}...")
+                        logger.info(f"[TOOL RESULT] {name} returned: {content[:200]}...")
 
                         # Show tool result to user in a nice format
                         try:
@@ -314,13 +348,13 @@ def run_chat(binary: str | None, boundary_ckpt: str | None, model_id: str, ollam
             text = (msg.content or "").strip()
             if text:
                 print(f"\nagent> {text}\n")
-                logging.info(f"[ASSISTANT RESPONSE]\n{text}")
+                logger.info(f"[ASSISTANT RESPONSE]\n{text}")
             messages.append({"role": "assistant", "content": text})
             break
 
-    logging.info("="*80)
-    logging.info(f"CHAT SESSION ENDED - {datetime.now()}")
-    logging.info("="*80)
+    logger.info("="*80)
+    logger.info(f"CHAT SESSION ENDED - {datetime.now()}")
+    logger.info("="*80)
 
 
 def main():
