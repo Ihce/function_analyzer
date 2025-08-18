@@ -1,0 +1,23 @@
+2025-08-18 12:07:07 - [INFO] agent - ================================================================================
+2025-08-18 12:07:07 - [INFO] agent - NEW ANALYSIS SESSION - Model: gpt-oss:20b
+2025-08-18 12:07:07 - [INFO] agent - Ollama URL: http://localhost:11434/v1
+2025-08-18 12:07:07 - [INFO] agent - ================================================================================
+2025-08-18 12:07:07 - [DEBUG] agent - Available tools: ['binary_loader', 'boundary_detector', 'disassembler']
+2025-08-18 12:07:07 - [INFO] agent - ================================================================================
+2025-08-18 12:07:07 - [INFO] agent - CHAT SESSION STARTED - 2025-08-18 12:07:07.904311
+2025-08-18 12:07:07 - [INFO] agent - Model: gpt-oss:20b
+2025-08-18 12:07:07 - [INFO] agent - Binary hint: /hdd/dylan/function_analyzer/Notepad_binary.bin
+2025-08-18 12:07:07 - [INFO] agent - Enhanced prompts: False
+2025-08-18 12:07:07 - [INFO] agent - ================================================================================
+2025-08-18 12:07:20 - [INFO] agent - [USER INPUT] Show me the assembly code from /hdd/dylan/function_analyzer/Notepad_binary.bin
+2025-08-18 12:07:20 - [DEBUG] agent - [CONVERSATION] Added user message: Show me the assembly code from /hdd/dylan/function_analyzer/Notepad_binary.bin (Note: you can analyz...
+2025-08-18 12:07:20 - [DEBUG] agent - [CHAT LOOP] Iteration 1
+2025-08-18 12:07:20 - [DEBUG] agent - [API] Calling gpt-oss:20b with 2 messages
+2025-08-18 12:07:23 - [DEBUG] agent - [LLM RESPONSE] Content: 
+2025-08-18 12:07:46 - [INFO] agent - [USER INPUT] /open /hdd/dylan/function_analyzer/Notepad_binary.bin
+2025-08-18 12:07:46 - [INFO] agent - [OPEN COMMAND] Guided analysis of: /hdd/dylan/function_analyzer/Notepad_binary.bin
+2025-08-18 12:07:46 - [DEBUG] agent - [CONVERSATION] Added user message: Please analyze the binary file at /hdd/dylan/function_analyzer/Notepad_binary.bin. First load it wit...
+2025-08-18 12:07:46 - [DEBUG] agent - [CHAT LOOP] Iteration 1
+2025-08-18 12:07:46 - [DEBUG] agent - [API] Calling gpt-oss:20b with 4 messages
+2025-08-18 12:07:49 - [DEBUG] agent - [LLM RESPONSE] Content: 
+2025-08-18 12:08:05 - [INFO] agent - [USER INPUT] /verbose
