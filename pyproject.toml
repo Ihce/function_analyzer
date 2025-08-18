@@ -9,6 +9,7 @@ dependencies = [
     "mamba-ssm>=2.2.5",
     "numpy>=2.2.6",
     "ollama>=0.5.2",
+    "openai>=1.100.0",
     "pefile>=2024.8.26",
     "pydantic>=2.11.7",
     "pyelftools>=0.32",
