@@ -76,19 +76,21 @@ def run_chat(binary: str | None, boundary_ckpt: str | None, model_id: str, ollam
     # Initialize conversation with system prompt
     messages = [{"role": "system", "content": system_prompt}]
 
-    # Setup logging
+    # Setup logging for chat module
     logger = logging.getLogger("chat")
     logger.setLevel(logging.INFO if not verbose else logging.DEBUG)
+    logger.handlers = []  # Clear existing handlers
 
     # File handler
     if log_file:
         file_handler = logging.FileHandler(log_file, mode='a')
         file_handler.setFormatter(logging.Formatter(
-            '%(asctime)s - [%(levelname)s] %(message)s',
+            '%(asctime)s - [%(levelname)s] %(name)s - %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
         ))
         logger.addHandler(file_handler)
-
+    if not boundary_ckpt:
+        boundary_ckpt = "models/function_boundary.pth"
     # Console handler
     if not no_console:
         console_handler = logging.StreamHandler()
@@ -154,8 +156,9 @@ def run_chat(binary: str | None, boundary_ckpt: str | None, model_id: str, ollam
 
         elif user == "/tools":
             print("\nAvailable tools:")
-            for i, tool in enumerate(agent.functions, 1):
-                print(f"{i}. {tool['name']}: {tool.get('description', 'No description')[:100]}...")
+            for i, tool in enumerate(agent.tools, 1):
+                func_info = tool.get('function', {})
+                print(f"{i}. {func_info.get('name', 'Unknown')}: {func_info.get('description', 'No description')[:100]}...")
             print()
             continue
 
@@ -201,7 +204,7 @@ def run_chat(binary: str | None, boundary_ckpt: str | None, model_id: str, ollam
                 if file_logging_enabled and log_file:
                     file_handler = logging.FileHandler(log_file, mode='a')
                     file_handler.setFormatter(logging.Formatter(
-                        '%(asctime)s - [%(levelname)s] %(message)s',
+                        '%(asctime)s - [%(levelname)s] %(name)s - %(message)s',
                         datefmt='%Y-%m-%d %H:%M:%S'
                     ))
                     logger.addHandler(file_handler)
@@ -281,8 +284,8 @@ Use all three tools in sequence to perform a complete analysis."""
                 resp = agent.client.chat.completions.create(
                     model=agent.model_id,
                     messages=messages,
-                    functions=agent.functions,
-                    function_call="auto",
+                    tools=agent.tools,  # Use 'tools' instead of 'functions'
+                    tool_choice="auto",  # Use 'tool_choice' instead of 'function_call'
                     temperature=0.3,  # Lower temperature for more consistent tool use
                 )
                 msg = resp.choices[0].message
@@ -296,52 +299,77 @@ Use all three tools in sequence to perform a complete analysis."""
             # Log response
             if verbose:
                 logger.debug(f"[LLM RESPONSE] Content: {msg.content}")
-                if hasattr(msg, 'function_call') and msg.function_call:
-                    logger.debug(f"[LLM RESPONSE] Function call: {msg.function_call.name}")
-                    logger.debug(f"[LLM RESPONSE] Function args: {msg.function_call.arguments}")
+                if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                    for tool_call in msg.tool_calls:
+                        logger.debug(f"[LLM RESPONSE] Tool call: {tool_call.function.name}")
+                        logger.debug(f"[LLM RESPONSE] Tool args: {tool_call.function.arguments}")
 
-            # Check if model wants to call a tool
-            if getattr(msg, "function_call", None):
-                name = msg.function_call.name
-                raw = msg.function_call.arguments or "{}"
+            # Check if model wants to call tools
+            if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                # Handle multiple tool calls
+                for tool_call in msg.tool_calls:
+                    name = tool_call.function.name
+                    raw = tool_call.function.arguments or "{}"
 
-                print(f"[Calling tool: {name}]")
-                logger.info(f"[LLM DECISION] Model wants to call tool: {name}")
-                logger.debug(f"[LLM DECISION] Tool arguments: {raw}")
+                    print(f"[Calling tool: {name}]")
+                    logger.info(f"[LLM DECISION] Model wants to call tool: {name}")
+                    logger.debug(f"[LLM DECISION] Tool arguments: {raw}")
 
-                try:
-                    parsed = json.loads(raw)
-                except Exception as e:
-                    logger.error(f"[ERROR] Failed to parse tool arguments: {e}")
-                    parsed = {}
+                    try:
+                        parsed = json.loads(raw)
+                    except Exception as e:
+                        logger.error(f"[ERROR] Failed to parse tool arguments: {e}")
+                        parsed = {}
 
-                # Execute the tool
-                func_tuple = agent._tools.get(name)
-                if not func_tuple:
-                    content = json.dumps({"error": f"Unknown tool: {name}"})
-                    logger.error(f"[ERROR] Unknown tool requested: {name}")
-                else:
-                    func, ArgsModel = func_tuple
-                    kwargs, err = agent._validate_args(parsed, ArgsModel)
-                    if err:
-                        content = json.dumps({"error": f"Invalid arguments: {err}"})
-                        logger.error(f"[ERROR] Invalid tool arguments: {err}")
+                    # Execute the tool
+                    func_tuple = agent._tools.get(name)
+                    if not func_tuple:
+                        content = json.dumps({"error": f"Unknown tool: {name}"})
+                        logger.error(f"[ERROR] Unknown tool requested: {name}")
                     else:
-                        logger.info(f"[TOOL EXEC] Executing {name}")
-                        content = func(**kwargs)
-                        logger.info(f"[TOOL RESULT] {name} returned: {content[:200]}...")
+                        func, ArgsModel = func_tuple
+                        kwargs, err = agent._validate_args(parsed, ArgsModel)
+                        if err:
+                            content = json.dumps({"error": f"Invalid arguments: {err}"})
+                            logger.error(f"[ERROR] Invalid tool arguments: {err}")
+                        else:
+                            logger.info(f"[TOOL EXEC] Executing {name}")
+                            content = func(**kwargs)
+                            logger.info(f"[TOOL RESULT] {name} returned: {content[:200]}...")
 
-                        # Show tool result to user in a nice format
-                        try:
-                            result = json.loads(content)
-                            if "error" in result:
-                                print(f"  ❌ {result['error']}")
-                            else:
-                                print(f"  ✓ {result.get('summary', 'Success')}")
-                        except:
-                            print(f"  Result: {content[:100]}...")
+                            # Show tool result to user in a nice format
+                            try:
+                                result = json.loads(content)
+                                if "error" in result:
+                                    print(f"  ❌ {result['error']}")
+                                else:
+                                    print(f"  ✓ {result.get('summary', 'Success')}")
+                            except:
+                                print(f"  Result: {content[:100]}...")
 
-                messages.append({"role": "function", "name": name, "content": content})
+                    # Add tool response message
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "name": name,
+                        "content": content
+                    })
+
+                # Add the assistant message with tool calls
+                messages.append({
+                    "role": "assistant",
+                    "content": msg.content,
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments
+                            }
+                        } for tc in msg.tool_calls
+                    ]
+                })
                 continue
 
             # Normal assistant reply
@@ -360,7 +388,7 @@ Use all three tools in sequence to perform a complete analysis."""
 def main():
     ap = argparse.ArgumentParser(description="Chat with the GPT-OSS binary analysis agent.")
     ap.add_argument("--binary", help="Default binary path for analysis")
-    ap.add_argument("--boundary-ckpt", help="Path to boundary detector model checkpoint")
+    ap.add_argument("--boundary_ckpt", help="Path to boundary detector model checkpoint")
     ap.add_argument("--model-id", default="gpt-oss:20b", help="Model ID for Ollama")
     ap.add_argument("--ollama-url", default="http://localhost:11434/v1", help="Ollama API URL")
     ap.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging")

@@ -16,11 +16,6 @@ from .components import disassembler as dz
 
 
 class BinaryAnalysisAgent:
-    """
-    Keeps state in-memory; the LLM decides which tool to call. We validate args via Pydantic
-    (from each component's ArgsModel) before invoking the real tool .run() methods.
-    """
-
     def __init__(
         self,
         *,
@@ -28,16 +23,16 @@ class BinaryAnalysisAgent:
         model_id: str = "gpt-oss:20b",
         boundary_ckpt: Optional[str] = None,
         logger: Optional[logging.Logger] = None,
-        verbose: bool = True,  # Add verbose flag for detailed logging
-        log_file: Optional[str] = "agent_analysis.log",  # Log file path
-        log_to_console: bool = True,  # Also log to console
+        verbose: bool = True,
+        log_file: Optional[str] = "agent_analysis.log",
+        log_to_console: bool = True,
     ) -> None:
         self.client = OpenAI(base_url=ollama_url, api_key="ollama")
         self.model_id = model_id
         self.boundary_ckpt = boundary_ckpt
         self.verbose = verbose
 
-        # Set up logging
+        # Set up logging (existing code...)
         self.log = logger or logging.getLogger("agent")
         if self.verbose:
             self.log.setLevel(logging.DEBUG)
@@ -47,53 +42,54 @@ class BinaryAnalysisAgent:
         # Clear existing handlers to avoid duplicates
         self.log.handlers = []
 
-        # Create formatters
-        detailed_formatter = logging.Formatter(
-            '%(asctime)s - [%(levelname)s] %(name)s - %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
-        )
-        simple_formatter = logging.Formatter('[%(levelname)s] %(message)s')
-
-        # Add file handler if log_file is specified
+        # Add handlers (existing code...)
         if log_file:
             file_handler = logging.FileHandler(log_file, mode='a')
-            file_handler.setFormatter(detailed_formatter)
+            file_handler.setFormatter(logging.Formatter(
+                '%(asctime)s - [%(levelname)s] %(name)s - %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            ))
             self.log.addHandler(file_handler)
-
-            # Log session start
             self.log.info("="*80)
             self.log.info(f"NEW ANALYSIS SESSION - Model: {model_id}")
             self.log.info(f"Ollama URL: {ollama_url}")
             self.log.info("="*80)
 
-        # Add console handler if requested
         if log_to_console:
             console_handler = logging.StreamHandler()
-            console_handler.setFormatter(simple_formatter)
+            console_handler.setFormatter(logging.Formatter('[%(levelname)s] %(message)s'))
             self.log.addHandler(console_handler)
 
-        # Instantiate tools
+        # Initialize tools
         self.loader = bl.BinaryLoaderTool()
         self.boundaries = bd.BoundaryDetectorTool()
         self.disasm = dz.DisassemblerTool()
 
-        # Self-described function schemas from components
-        self.functions = [
-            bl.BinaryLoaderTool.tool_spec(),
-            bd.BoundaryDetectorTool.tool_spec(),
-            dz.DisassemblerTool.tool_spec(),
+        # Convert to OpenAI tools format
+        self.tools = [
+            {
+                "type": "function",
+                "function": bl.BinaryLoaderTool.tool_spec()
+            },
+            {
+                "type": "function",
+                "function": bd.BoundaryDetectorTool.tool_spec()
+            },
+            {
+                "type": "function",
+                "function": dz.DisassemblerTool.tool_spec()
+            }
         ]
 
-        self.log.debug(f"Available tools: {[f['name'] for f in self.functions]}")
+        self.log.debug(f"Available tools: {[t['function']['name'] for t in self.tools]}")
 
-        # State shared between tool calls
+        # State and tool mapping (existing code...)
         self.state: Dict[str, Any] = {
-            "binary": None,        # result from loader
-            "functions": None,     # list from boundary detector
-            "disassembly": None,   # list from disassembler
+            "binary": None,
+            "functions": None,
+            "disassembly": None,
         }
 
-        # Map tool -> (callable, ArgsModel)
         self._tools: Dict[str, Tuple[Any, Type]] = {
             bl.BinaryLoaderTool.name: (self._call_binary_loader, bl.BinaryLoaderTool.ArgsModel),
             bd.BoundaryDetectorTool.name: (self._call_boundary_detector, bd.BoundaryDetectorTool.ArgsModel),
@@ -156,6 +152,7 @@ class BinaryAnalysisAgent:
             return None
         ckpt = model_path or self.boundary_ckpt
         if not ckpt:
+            ckpt = "models/function_boundary.pth"
             return "Boundary model checkpoint was not provided."
         try:
             self.log.info(f"[MODEL] Loading boundary detector model: {ckpt}")
