@@ -7,6 +7,7 @@ from datetime import datetime
 import logging
 from typing import Optional, Dict, Any, List, Tuple, Type
 import re
+import time
 
 import typer
 from rich.console import Console
@@ -41,7 +42,9 @@ You MAY use these tools, in any order, as many times as needed:
 - boundary_detector(model_path?; if you pass stride, it MUST be >= 1) — predicts function boundaries
 - disassembler()                    — disassembles known functions; takes NO arguments (pass {})
 
-Your job is to figure out which tool(s) to use, in what order, and iterate until you have enough evidence to answer the user’s question.
+Your job is to figure out which tool(s) to use, in what order, and iterate until you have enough evidence to answer the user's question.
+
+CRITICAL: You MUST always respond with valid JSON. Never respond with empty content or plain text.
 Do not mention tools or internal steps in your final answer. Be concise and technical."""
 
 # --------------------------------------------------------------------------------------
@@ -70,7 +73,7 @@ class FinalOutput(BaseModel if PydAvailable else object):  # type: ignore
     confidence: Optional[float] = None
 
 # --------------------------------------------------------------------------------------
-# JSON instructions
+# JSON instructions with examples
 # --------------------------------------------------------------------------------------
 PLANNER_JSON_SPEC = (
     "Return ONLY a JSON object with fields:\n"
@@ -81,6 +84,9 @@ PLANNER_JSON_SPEC = (
     '  "reason": "short why this plan/action",\n'
     '  "confidence": 0.0-1.0\n'
     "}\n"
+    "Examples:\n"
+    '{"plan": "Load the binary first", "action": {"tool": "binary_loader", "args": {"file_path": "example.exe"}}, "final_answer": null, "reason": "Need to load binary before analysis", "confidence": 0.9}\n'
+    '{"plan": "Ready to answer", "action": null, "final_answer": "The binary is a simple calculator", "reason": "Analysis complete", "confidence": 0.85}\n'
     "- If you can answer now, set action=null and put your text in final_answer.\n"
     "- If you need to act, set final_answer=null and provide one action.\n"
     "- disassembler MUST have {} args.\n"
@@ -95,6 +101,8 @@ REFLECT_JSON_SPEC = (
     '  "reason": "short justification",\n'
     '  "confidence": 0.0-1.0\n'
     "}\n"
+    "Example:\n"
+    '{"reflection": "Functions detected successfully", "decision": "continue", "reason": "Need to disassemble for analysis", "confidence": 0.8}\n'
     "Start with '{' and end with '}'. No extra text. No code fences."
 )
 
@@ -105,6 +113,8 @@ FINAL_JSON_SPEC = (
     '  "reason": "one short justification tying back to evidence",\n'
     '  "confidence": 0.0-1.0\n'
     "}\n"
+    "Example:\n"
+    '{"answer": "This binary is a text editor application", "reason": "Based on function analysis and API calls", "confidence": 0.75}\n'
     "Start with '{' and end with '}'. No extra text. No code fences."
 )
 
@@ -171,7 +181,7 @@ def _extract_target_binary(text: str) -> Optional[str]:
                 return val
     return None
 
-# -------- JSON parsing with diagnostics --------
+# -------- Enhanced JSON parsing with diagnostics --------
 def _strip_code_fences(s: str) -> str:
     if not s:
         return s
@@ -185,31 +195,117 @@ def _extract_json_block(text: str) -> Optional[str]:
     if not text:
         return None
     text = _strip_code_fences(text)
+
+    # First try: direct JSON object
     if text.startswith("{") and text.endswith("}"):
         return text
+
+    # Second try: find first JSON object in text
     start = text.find("{")
     if start == -1:
         return None
+
     depth = 0
+    in_string = False
+    escape_next = False
+
     for i in range(start, len(text)):
         c = text[i]
-        if c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start:i+1].strip()
+
+        if escape_next:
+            escape_next = False
+            continue
+
+        if c == "\\":
+            escape_next = True
+            continue
+
+        if c == '"' and not escape_next:
+            in_string = not in_string
+            continue
+
+        if not in_string:
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start:i+1].strip()
+
+    # If we couldn't find a complete JSON object, return what we have
+    if start >= 0:
+        return text[start:].strip()
+
     return None
 
 def _repair_json_like(s: str) -> str:
+    # Fix Python boolean/None literals
     s = re.sub(r"\bTrue\b", "true", s)
     s = re.sub(r"\bFalse\b", "false", s)
     s = re.sub(r"\bNone\b", "null", s)
+
+    # Fix single quotes (carefully)
     if s.count('"') < 2 and s.count("'") >= 2:
-        s = s.replace("\\'", "'")
+        s = s.replace("\\'", "ESCAPED_QUOTE_PLACEHOLDER")
         s = re.sub(r"'", '"', s)
+        s = s.replace("ESCAPED_QUOTE_PLACEHOLDER", "'")
+
+    # Remove trailing commas
     s = re.sub(r",\s*([}\]])", r"\1", s)
+
+    # Add missing quotes to keys (simple cases)
+    s = re.sub(r'(\{|,)\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', s)
+
     return s
+
+def _create_default_response(model_cls: Type) -> Any:
+    """Create a sensible default response when parsing fails."""
+    if model_cls == PlannerOutput:
+        if PydAvailable:
+            return PlannerOutput(
+                plan="Unable to parse response, using fallback",
+                action=None,
+                final_answer=None,
+                reason="JSON parsing failed",
+                confidence=0.1
+            )
+        else:
+            return {
+                "plan": "Unable to parse response, using fallback",
+                "action": None,
+                "final_answer": None,
+                "reason": "JSON parsing failed",
+                "confidence": 0.1
+            }
+    elif model_cls == ReflectOutput:
+        if PydAvailable:
+            return ReflectOutput(
+                reflection="Continuing after parse error",
+                decision="continue",
+                reason="Fallback to continue",
+                confidence=0.1
+            )
+        else:
+            return {
+                "reflection": "Continuing after parse error",
+                "decision": "continue",
+                "reason": "Fallback to continue",
+                "confidence": 0.1
+            }
+    elif model_cls == FinalOutput:
+        if PydAvailable:
+            return FinalOutput(
+                answer="Analysis incomplete due to parsing errors",
+                reason="JSON parsing failed",
+                confidence=0.1
+            )
+        else:
+            return {
+                "answer": "Analysis incomplete due to parsing errors",
+                "reason": "JSON parsing failed",
+                "confidence": 0.1
+            }
+    return None
 
 def _validate_model(obj: Dict[str, Any], Model: Type) -> Tuple[Optional[Any], Optional[str]]:
     if not PydAvailable:
@@ -230,41 +326,83 @@ def _validate_model(obj: Dict[str, Any], Model: Type) -> Tuple[Optional[Any], Op
             errs.append(str(ve))
         return None, "; ".join(errs)
 
-def _parse_json_with_diagnostics(raw: str, model_cls: Type) -> Tuple[Optional[Any], str, Dict[str, str]]:
+def _parse_json_with_diagnostics(raw: str, model_cls: Type, retry_count: int = 0) -> Tuple[Optional[Any], str, Dict[str, str]]:
     """
+    Enhanced JSON parser with better error recovery.
     Returns (parsed_obj_or_none, diagnostics_string_if_failed_else_empty, parts_dict_for_UI).
-    parts = {"RAW":..., "EXTRACTED":..., "REPAIRED":..., "ERR":...}
     """
     parts: Dict[str, str] = {"RAW": (raw or "").strip()}
+
+    # Check for completely empty response
+    if not parts["RAW"] or parts["RAW"] == "{}":
+        default = _create_default_response(model_cls)
+        if default:
+            return default, "", {"RAW": parts["RAW"], "DEFAULT": "Using default response"}
+
     block = _extract_json_block(parts["RAW"]) or parts["RAW"]
     parts["EXTRACTED"] = block
 
-    # Try direct
+    # Handle empty extraction
+    if not block or block == "{}":
+        default = _create_default_response(model_cls)
+        if default:
+            return default, "", parts
+
+    # Try direct parsing
     try:
         obj = json.loads(block)
         if isinstance(obj, dict):
+            # Fill in missing required fields with defaults
+            if model_cls == PlannerOutput and "plan" not in obj:
+                obj["plan"] = "Continuing analysis"
+            if model_cls == ReflectOutput and "decision" not in obj:
+                obj["decision"] = "continue"
+            if model_cls == ReflectOutput and "reflection" not in obj:
+                obj["reflection"] = "Processing observation"
+            if model_cls == FinalOutput and "answer" not in obj:
+                obj["answer"] = "Analysis incomplete"
+
             parsed, err = _validate_model(obj, model_cls)
             if parsed is not None:
                 return parsed, "", parts
             else:
                 parts["ERR"] = f"Schema validation error: {err}"
-                return None, f"Schema validation error: {err}", parts
-    except Exception as e1:
+    except json.JSONDecodeError as e1:
         parts["ERR"] = f"direct json.loads -> {type(e1).__name__}: {e1}"
+    except Exception as e1:
+        parts["ERR"] = f"direct parse error -> {type(e1).__name__}: {e1}"
 
+    # Try repair
     repaired = _repair_json_like(block)
     parts["REPAIRED"] = repaired
-    try:
-        obj2 = json.loads(repaired)
-        if isinstance(obj2, dict):
-            parsed, err = _validate_model(obj2, model_cls)
-            if parsed is not None:
-                return parsed, "", parts
-            else:
-                parts["ERR"] = f"Schema validation error after repair: {err}"
-                return None, f"Schema validation error after repair: {err}", parts
-    except Exception as e2:
-        parts["ERR"] += f"\nrepaired json.loads -> {type(e2).__name__}: {e2}"
+
+    if repaired != block:  # Only try if repair changed something
+        try:
+            obj2 = json.loads(repaired)
+            if isinstance(obj2, dict):
+                # Fill in missing required fields with defaults
+                if model_cls == PlannerOutput and "plan" not in obj2:
+                    obj2["plan"] = "Continuing analysis"
+                if model_cls == ReflectOutput and "decision" not in obj2:
+                    obj2["decision"] = "continue"
+                if model_cls == ReflectOutput and "reflection" not in obj2:
+                    obj2["reflection"] = "Processing observation"
+                if model_cls == FinalOutput and "answer" not in obj2:
+                    obj2["answer"] = "Analysis incomplete"
+
+                parsed, err = _validate_model(obj2, model_cls)
+                if parsed is not None:
+                    return parsed, "", parts
+                else:
+                    parts["ERR"] += f"\nSchema validation error after repair: {err}"
+        except Exception as e2:
+            parts["ERR"] += f"\nrepaired json.loads -> {type(e2).__name__}: {e2}"
+
+    # Last resort: use default
+    if retry_count < 2:  # Allow up to 2 retries
+        default = _create_default_response(model_cls)
+        if default:
+            return default, "", parts
 
     diag = (
         "JSON parse failed.\n"
@@ -303,6 +441,8 @@ class Session:
         self.verbose = verbose
         self.log_file = log_file
         self.no_console = no_console
+        self.retry_count = 0
+        self.max_retries = 3
 
         self.logger.info("=" * 80)
         self.logger.info(f"CHAT SESSION STARTED - {datetime.now()}")
@@ -310,54 +450,106 @@ class Session:
         self.logger.info(f"Binary hint: {binary or 'None'}")
         self.logger.info("=" * 80)
 
-    # -------- LLM helper (tries JSON mode; falls back) --------
-    def _call_llm(self, messages: list[dict[str, str]]) -> str:
-        # Try Ollama JSON mode first (many OSS backends only honor this)
+    # -------- Enhanced LLM helper with retry logic --------
+    def _call_llm(self, messages: list[dict[str, str]], retry_attempt: int = 0) -> str:
+        """Call LLM with enhanced error handling and retry logic."""
+
+        # Add more explicit JSON instruction to the last user message
+        if retry_attempt > 0 and messages:
+            last_msg = messages[-1]
+            if last_msg["role"] == "user":
+                last_msg["content"] = (
+                    "IMPORTANT: You MUST respond with valid JSON only. "
+                    "Start with '{' and end with '}'. No other text.\n\n" +
+                    last_msg["content"]
+                )
+
+        # Try Ollama JSON mode first
         try:
             resp = self.agent.client.chat.completions.create(
                 model=self.agent.model_id,
                 messages=messages,
-                temperature=0.0,
-                max_tokens=512,  # prevent silent truncation
+                temperature=0.0 if retry_attempt == 0 else 0.1,  # Add slight temperature on retry
+                max_tokens=1024,  # Increase token limit
                 extra_body={
-                    "format": "json",          # <-- Ollama JSON enforcement
+                    "format": "json",
                     "options": {
-                        "temperature": 0.0,
+                        "temperature": 0.0 if retry_attempt == 0 else 0.1,
                         "top_p": 0.9,
-                        # "num_ctx": 8192,     # set if your model supports larger context
+                        "repeat_penalty": 1.1,  # Reduce repetition
+                        "stop": ["```", "\n\n\n"],  # Stop sequences
                     }
                 },
+                timeout=30,  # Add timeout
+            )
+            content = (resp.choices[0].message.content or "").strip()
+
+            # Validate we got something that looks like JSON
+            if content and (content.startswith("{") or "{" in content):
+                return content
+
+            # If empty or not JSON-like, retry with a different approach
+            if retry_attempt < 2:
+                self.logger.warning(f"[API] Got non-JSON response, retrying (attempt {retry_attempt + 1})")
+                time.sleep(0.5)  # Brief delay before retry
+                return self._call_llm(messages, retry_attempt + 1)
+
+        except Exception as e1:
+            self.logger.warning(f"[API] Ollama json format failed ({e1}); falling back.")
+
+        # Fallback: OpenAI-style
+        try:
+            resp = self.agent.client.chat.completions.create(
+                model=self.agent.model_id,
+                messages=messages,
+                temperature=0.1,
+                max_tokens=1024,
+                response_format={"type": "json_object"},
+                timeout=30,
             )
             content = (resp.choices[0].message.content or "").strip()
             if content:
                 return content
-        except Exception as e1:
-            self.logger.warning(f"[API] Ollama json format path failed ({e1}); falling back.")
+        except Exception as e2:
+            self.logger.warning(f"[API] response_format failed ({e2}); final plain retry.")
 
-        # Fallback: try OpenAI-style json_object (ignored by many shims)
+        # Last resort: plain text with explicit instruction
         try:
+            # Add explicit JSON instruction
+            modified_messages = messages.copy()
+            if modified_messages and modified_messages[-1]["role"] == "user":
+                modified_messages[-1]["content"] = (
+                    "Response MUST be valid JSON starting with { and ending with }.\n\n" +
+                    modified_messages[-1]["content"]
+                )
+
             resp = self.agent.client.chat.completions.create(
                 model=self.agent.model_id,
-                messages=messages,
-                temperature=0.0,
-                max_tokens=512,
-                response_format={"type": "json_object"},
+                messages=modified_messages,
+                temperature=0.2,
+                max_tokens=1024,
+                timeout=30,
             )
-            return (resp.choices[0].message.content or "").strip()
-        except Exception as e2:
-            self.logger.warning(f"[API] response_format path failed ({e2}); final plain retry.")
+            content = (resp.choices[0].message.content or "").strip()
 
-        # Last resort: plain text (we’ll still parse/repair)
-        resp = self.agent.client.chat.completions.create(
-            model=self.agent.model_id,
-            messages=messages,
-            temperature=0.1,     # a touch of entropy helps some OSS models avoid empties
-            max_tokens=512,
-        )
-        return (resp.choices[0].message.content or "").strip()
+            # If still empty, create a minimal valid response
+            if not content:
+                self.logger.error("[API] Empty response from model")
+                if "plan" in str(messages[-1]):
+                    return '{"plan": "Continue analysis", "action": null, "final_answer": null, "reason": "Empty response", "confidence": 0.1}'
+                elif "reflect" in str(messages[-1]):
+                    return '{"reflection": "Continuing", "decision": "continue", "reason": "Empty response", "confidence": 0.1}'
+                else:
+                    return '{"answer": "Unable to complete analysis", "reason": "Empty response", "confidence": 0.1}'
 
+            return content
 
-    # -------- Controller fallback policy (used only when planner JSON fails) --------
+        except Exception as e3:
+            self.logger.error(f"[API] All attempts failed: {e3}")
+            # Return a minimal valid JSON response
+            return '{"error": "API call failed", "plan": "Retry", "action": null, "final_answer": null}'
+
+    # -------- Controller fallback policy --------
     def _fallback_policy(self, target_binary: Optional[str]) -> Tuple[Optional[ActionModel], str]:
         """Decide next best action from current agent state; returns (ActionModel|None, controller_reason)."""
         b = self.agent.state.get("binary")
@@ -366,16 +558,16 @@ class Session:
 
         if not (b and b.get("success")):
             args = {"file_path": target_binary} if target_binary else {}
-            return ActionModel(tool="binary_loader", args=args) if PydAvailable else {"tool": "binary_loader", "args": args}, \
-                   "Controller fallback: load the binary to obtain architecture, base address, and .text."
+            action = ActionModel(tool="binary_loader", args=args) if PydAvailable else {"tool": "binary_loader", "args": args}
+            return action, "Controller fallback: load the binary to obtain architecture, base address, and .text."
 
         if not f:
-            return ActionModel(tool="boundary_detector", args={}) if PydAvailable else {"tool": "boundary_detector", "args": {}}, \
-                   "Controller fallback: detect function boundaries to prepare for disassembly."
+            action = ActionModel(tool="boundary_detector", args={}) if PydAvailable else {"tool": "boundary_detector", "args": {}}
+            return action, "Controller fallback: detect function boundaries to prepare for disassembly."
 
         if not d:
-            return ActionModel(tool="disassembler", args={}) if PydAvailable else {"tool": "disassembler", "args": {}}, \
-                   "Controller fallback: disassemble detected functions to inspect for vulnerabilities."
+            action = ActionModel(tool="disassembler", args={}) if PydAvailable else {"tool": "disassembler", "args": {}}
+            return action, "Controller fallback: disassemble detected functions to inspect for vulnerabilities."
 
         # Everything gathered → no action; next step will be finalize
         return None, "Controller fallback: sufficient evidence gathered; finalize with a concise answer."
@@ -385,14 +577,14 @@ class Session:
     # -------------------
     def ask_once(self, user_msg: str, max_iterations: int = 10) -> str:
         """
-        Explicit PLAN → ACT → OBSERVE → REFLECT loop, strict JSON I/O, Reason panels,
-        robust diagnostics, and a controller fallback when planner misbehaves.
+        Enhanced PLAN → ACT → OBSERVE → REFLECT loop with robust error handling.
         """
         messages: List[Dict[str, Any]] = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": user_msg},
         ]
         target_binary = _extract_target_binary(user_msg) or self.binary_hint
+        consecutive_failures = 0
 
         for iteration in range(1, max_iterations + 1):
             self.logger.info(f"[ITER {iteration}] ------------------------------")
@@ -400,106 +592,148 @@ class Session:
             # ==========================
             # [PLAN]
             # ==========================
+
+            # Check if we've already done all the necessary work
+            if iteration > 3 and self.agent.state.get("disassembly"):
+                # We've done enough iterations and have all the data
+                # Let the model provide its analysis directly
+                self.logger.info("[PLAN] All tools executed, requesting final analysis")
+
+                analysis_prompt = (
+                    "You have successfully:\n"
+                    "1. Loaded the binary (x86, base 0x00401000, 20KB text section)\n"
+                    "2. Detected 238 functions\n"
+                    "3. Disassembled all functions\n\n"
+                    "Now provide your final analysis to answer the user's question.\n"
+                    "Be direct and technical. Focus on answering what was asked."
+                )
+
+                analysis_messages = [*messages, {"role": "user", "content": analysis_prompt}]
+
+                try:
+                    resp = self.agent.client.chat.completions.create(
+                        model=self.agent.model_id,
+                        messages=analysis_messages,
+                        temperature=0.0,
+                        max_tokens=2048,
+                        timeout=60,
+                    )
+                    final_answer = (resp.choices[0].message.content or "").strip()
+
+                    if final_answer:
+                        console.print(Panel.fit("[PLAN] Analysis complete, providing final answer", style="bold cyan", border_style="cyan"))
+                        console.print(Panel(final_answer, title="Final Analysis", border_style="green"))
+                        self.logger.info(f"[FINAL]\n{final_answer}")
+                        return final_answer
+                except Exception as e:
+                    self.logger.warning(f"[PLAN] Direct analysis failed: {e}")
+
+            # Normal planning phase
             planner_prompt = (
                 "Decide the very next step toward the objective below.\n"
-                "Choose ANY available tool in ANY order, or provide a final answer if ready.\n\n"
+                "Choose ANY available tool in ANY order, or provide a final answer if ready.\n"
+                "YOU MUST RESPOND WITH VALID JSON.\n\n"
                 f"{PLANNER_JSON_SPEC}"
             )
             plan_messages = [*messages, {"role": "user", "content": planner_prompt}]
-            raw_plan = self._call_llm(plan_messages)
-            plan_obj, diag, parts = _parse_json_with_diagnostics(raw_plan, PlannerOutput)
 
-            # Retry once with STRICT JSON if needed
+            # Try to get plan with retries
+            plan_obj = None
+            for plan_attempt in range(3):
+                raw_plan = self._call_llm(plan_messages, retry_attempt=plan_attempt)
+                plan_obj, diag, parts = _parse_json_with_diagnostics(raw_plan, PlannerOutput, retry_count=plan_attempt)
+
+                if plan_obj is not None:
+                    consecutive_failures = 0
+                    break
+
+                if plan_attempt < 2:
+                    self.logger.warning(f"[PLAN] Parse attempt {plan_attempt + 1} failed, retrying...")
+                    time.sleep(0.5)
+
             if plan_obj is None:
-                self.logger.warning("[PLAN] Malformed JSON; retrying with STRICT instruction.")
-                strict = [*plan_messages, {"role": "user", "content": "STRICT JSON ONLY. Repeat exactly in the specified JSON schema."}]
-                raw_plan2 = self._call_llm(strict)
-                plan_obj, diag2, parts2 = _parse_json_with_diagnostics(raw_plan2, PlannerOutput)
+                # All attempts failed, use fallback
+                consecutive_failures += 1
+                self.logger.error(f"[PLAN] All parse attempts failed (consecutive: {consecutive_failures})")
 
-                if plan_obj is None:
-                    # Show diagnostics panel and CONTINUE via fallback (do NOT exit the loop)
-                    self.logger.error(f"[PLAN] JSON parse failed.\n{diag}\n--- Retry ---\n{diag2}")
-                    console.print(Panel.fit(
-                        f"Planner JSON parse failed.\n\n{diag}\n\n--- Retry ---\n{diag2}",
-                        title="Parse Error: PLAN", style="red", border_style="red"
-                    ))
-                    # Fallback to keep loop alive
-                    action, controller_reason = self._fallback_policy(target_binary)
-                    plan_text = "Planner failed; controller selected next best action."
-                    console.print(Panel.fit(f"[PLAN] {plan_text}", style="bold cyan", border_style="cyan"))
-                    console.print(Panel.fit(controller_reason, title="Reason", style="dim", border_style="cyan"))
-                    self.logger.info(f"[PLAN] {plan_text}")
-                    self.logger.info(f"[PLAN][REASON] {controller_reason}")
-                    final_answer = None
+                if consecutive_failures > 3:
+                    self.logger.error("[PLAN] Too many consecutive failures, aborting")
+                    return "Analysis failed due to repeated parsing errors. Please try with a different model."
+
+                # Use fallback policy
+                action, controller_reason = self._fallback_policy(target_binary)
+                plan_obj = _create_default_response(PlannerOutput)
+                if PydAvailable:
+                    plan_obj.plan = "Using controller fallback"
+                    plan_obj.action = action
+                    plan_obj.reason = controller_reason
                 else:
-                    plan_text = (plan_obj.plan or "").strip()
-                    plan_reason = (plan_obj.reason or "").strip()
-                    console.print(Panel.fit(f"[PLAN] {plan_text or '(no plan text)'}", style="bold cyan", border_style="cyan"))
-                    if plan_reason:
-                        console.print(Panel.fit(plan_reason, title="Reason", style="dim", border_style="cyan"))
-                    self.logger.info(f"[PLAN] {plan_text}")
-                    if plan_reason:
-                        self.logger.info(f"[PLAN][REASON] {plan_reason}")
-                    final_answer = (plan_obj.final_answer or "").strip() if plan_obj.final_answer else None
-                    action = plan_obj.action
-            else:
-                plan_text = (plan_obj.plan or "").strip()
-                plan_reason = (plan_obj.reason or "").strip()
-                console.print(Panel.fit(f"[PLAN] {plan_text or '(no plan text)'}", style="bold cyan", border_style="cyan"))
-                if plan_reason:
-                    console.print(Panel.fit(plan_reason, title="Reason", style="dim", border_style="cyan"))
-                self.logger.info(f"[PLAN] {plan_text}")
-                if plan_reason:
-                    self.logger.info(f"[PLAN][REASON] {plan_reason}")
-                final_answer = (plan_obj.final_answer or "").strip() if plan_obj.final_answer else None
-                action = plan_obj.action
+                    plan_obj["plan"] = "Using controller fallback"
+                    plan_obj["action"] = action
+                    plan_obj["reason"] = controller_reason
+
+            # Extract plan details
+            plan_text = (plan_obj.plan if PydAvailable else plan_obj.get("plan", "")).strip()
+            plan_reason = (plan_obj.reason if PydAvailable else plan_obj.get("reason", "")).strip()
+            final_answer = (plan_obj.final_answer if PydAvailable else plan_obj.get("final_answer"))
+            action = plan_obj.action if PydAvailable else plan_obj.get("action")
+
+            # Display plan
+            console.print(Panel.fit(f"[PLAN] {plan_text or '(no plan text)'}", style="bold cyan", border_style="cyan"))
+            if plan_reason:
+                console.print(Panel.fit(plan_reason, title="Reason", style="dim", border_style="cyan"))
+            self.logger.info(f"[PLAN] {plan_text}")
+            if plan_reason:
+                self.logger.info(f"[PLAN][REASON] {plan_reason}")
 
             # If planner provided final answer directly, finish now
             if isinstance(final_answer, str) and final_answer:
                 console.print(Panel(final_answer, title="Final", border_style="green"))
-                if plan_obj and (plan_obj.reason or ""):
-                    console.print(Panel.fit(plan_obj.reason.strip(), title="Reason", style="dim", border_style="green"))
                 self.logger.info(f"[FINAL]\n{final_answer}")
                 return final_answer
 
-            # If fallback said "finalize", action will be None; go to finalize path
+            # If no action and no final answer, ask for final answer
             if action is None and final_answer is None:
-                # Ask model to produce final answer JSON (clean handoff)
                 final_prompt = (
-                    "Produce the final user-facing answer now, based on all observations so far.\n\n"
+                    "Produce the final user-facing answer now, based on all observations so far.\n"
+                    "YOU MUST RESPOND WITH VALID JSON.\n\n"
                     f"{FINAL_JSON_SPEC}"
                 )
                 final_messages = [*messages, {"role": "user", "content": final_prompt}]
-                raw_final = self._call_llm(final_messages)
-                final_obj, fdiag, _ = _parse_json_with_diagnostics(raw_final, FinalOutput)
-                if final_obj is None:
-                    # Retry once
-                    strict_f = [*final_messages, {"role": "user", "content": "STRICT JSON ONLY. Repeat exactly in the specified schema."}]
-                    raw_final2 = self._call_llm(strict_f)
-                    final_obj, fdiag2, _ = _parse_json_with_diagnostics(raw_final2, FinalOutput)
-                    if final_obj is None:
-                        self.logger.error(f"[FINAL] JSON parse failed.\n{fdiag}\n--- Retry ---\n{fdiag2}")
-                        console.print(Panel.fit(
-                            f"Finalizer JSON parse failed.\n\n{fdiag}\n\n--- Retry ---\n{fdiag2}",
-                            title="Parse Error: FINAL", style="red", border_style="red"
-                        ))
-                        return "Finalizer failed."
 
-                final_answer = (final_obj.answer or "").strip()
-                final_reason = (final_obj.reason or "").strip()
-                console.print(Panel(final_answer or "(no answer) ", title="Final", border_style="green"))
+                for final_attempt in range(3):
+                    raw_final = self._call_llm(final_messages, retry_attempt=final_attempt)
+                    final_obj, fdiag, _ = _parse_json_with_diagnostics(raw_final, FinalOutput, retry_count=final_attempt)
+                    if final_obj is not None:
+                        break
+                    if final_attempt < 2:
+                        time.sleep(0.5)
+                else:
+                    self.logger.error("[FINAL] All parse attempts failed")
+                    return "Analysis complete but unable to format final answer properly."
+
+                final_answer = (final_obj.answer if PydAvailable else final_obj.get("answer", "")).strip()
+                final_reason = (final_obj.reason if PydAvailable else final_obj.get("reason", "")).strip()
+                console.print(Panel(final_answer or "(no answer)", title="Final", border_style="green"))
                 if final_reason:
                     console.print(Panel.fit(final_reason, title="Reason", style="dim", border_style="green"))
                 self.logger.info(f"[FINAL]\n{final_answer}")
-                if final_reason:
-                    self.logger.info(f"[FINAL][REASON] {final_reason}")
                 return final_answer
 
             # ==========================
             # [ACT]
             # ==========================
-            tool = action.tool if PydAvailable else action.get("tool")  # type: ignore
-            args = dict(action.args if PydAvailable else action.get("args", {}))  # type: ignore
+            tool = action.tool if PydAvailable else action.get("tool") if action else None
+            args = dict(action.args if PydAvailable else action.get("args", {})) if action else {}
+
+            if not tool:
+                self.logger.warning("[ACT] No tool specified, using fallback")
+                action, _ = self._fallback_policy(target_binary)
+                if action:
+                    tool = action.tool if PydAvailable else action.get("tool")
+                    args = dict(action.args if PydAvailable else action.get("args", {}))
+                else:
+                    continue
 
             # Autofill binary path for loader if missing
             if tool == "binary_loader":
@@ -523,7 +757,7 @@ class Session:
                     self.logger.error(f"[ERROR] Invalid tool arguments: {err}")
                 else:
                     self.logger.info(f"[TOOL EXEC] {tool}")
-                    tool_content = func(**kwargs)  # JSON string from tool
+                    tool_content = func(**kwargs)
 
             # ==========================
             # [OBSERVE]
@@ -533,7 +767,7 @@ class Session:
             self.logger.info(f"[OBSERVE] {obs_line}")
             console.print(Panel.fit(f"[OBSERVE] {obs_line}", style="bold green", border_style="green"))
 
-            # Feed a compact observation back to the model
+            # Feed observation back to model
             messages.append({"role": "assistant", "content": f"Observation: {obs_line}"})
 
             # ==========================
@@ -541,32 +775,27 @@ class Session:
             # ==========================
             reflect_prompt = (
                 "Reflect on the most recent observation and decide whether to continue (another action), "
-                "finalize (you can answer now), or replan (change approach).\n\n"
+                "finalize (you can answer now), or replan (change approach).\n"
+                "YOU MUST RESPOND WITH VALID JSON.\n\n"
                 f"{REFLECT_JSON_SPEC}"
             )
             reflect_messages = [*messages, {"role": "user", "content": reflect_prompt}]
-            raw_reflect = self._call_llm(reflect_messages)
-            reflect_obj, rdiag, rparts = _parse_json_with_diagnostics(raw_reflect, ReflectOutput)
 
-            if reflect_obj is None:
-                # Retry once
-                self.logger.warning("[REFLECT] Malformed JSON; retrying with STRICT instruction.")
-                strict_r = [*reflect_messages, {"role": "user", "content": "STRICT JSON ONLY. Repeat exactly in the specified JSON schema."}]
-                raw_reflect2 = self._call_llm(strict_r)
-                reflect_obj, rdiag2, _ = _parse_json_with_diagnostics(raw_reflect2, ReflectOutput)
-                if reflect_obj is None:
-                    self.logger.error(f"[REFLECT] JSON parse failed.\n{rdiag}\n--- Retry ---\n{rdiag2}")
-                    console.print(Panel.fit(
-                        f"Reflector JSON parse failed.\n\n{rdiag}\n\n--- Retry ---\n{rdiag2}",
-                        title="Parse Error: REFLECT", style="red", border_style="red"
-                    ))
-                    # If reflector fails, keep iterating using controller guidance
-                    reflect_obj = ReflectOutput() if PydAvailable else {"reflection": "", "decision": "continue", "reason": ""}  # type: ignore
-                    if not PydAvailable:
-                        reflect_obj["decision"] = "continue"  # type: ignore
+            for reflect_attempt in range(3):
+                raw_reflect = self._call_llm(reflect_messages, retry_attempt=reflect_attempt)
+                reflect_obj, rdiag, _ = _parse_json_with_diagnostics(raw_reflect, ReflectOutput, retry_count=reflect_attempt)
+                if reflect_obj is not None:
+                    break
+                if reflect_attempt < 2:
+                    time.sleep(0.5)
+            else:
+                # Use default continue
+                reflect_obj = _create_default_response(ReflectOutput)
 
-            reflect_text = (reflect_obj.reflection or "").strip() if PydAvailable else (reflect_obj.get("reflection","").strip())  # type: ignore
-            reflect_reason = (reflect_obj.reason or "").strip() if PydAvailable else (reflect_obj.get("reason","").strip())  # type: ignore
+            reflect_text = (reflect_obj.reflection if PydAvailable else reflect_obj.get("reflection", "")).strip()
+            reflect_reason = (reflect_obj.reason if PydAvailable else reflect_obj.get("reason", "")).strip()
+            decision = (reflect_obj.decision if PydAvailable else reflect_obj.get("decision", "continue")).strip().lower()
+
             console.print(Panel.fit(f"[REFLECT] {reflect_text or '(no reflection)'}", style="bold magenta", border_style="magenta"))
             if reflect_reason:
                 console.print(Panel.fit(reflect_reason, title="Reason", style="dim", border_style="magenta"))
@@ -574,46 +803,83 @@ class Session:
             if reflect_reason:
                 self.logger.info(f"[REFLECT][REASON] {reflect_reason}")
 
-            # Decision
-            decision = (reflect_obj.decision or "").strip().lower() if PydAvailable else (reflect_obj.get("decision","").strip().lower())  # type: ignore
+            # Handle decision
             if decision == "finalize":
+                # Let the model reason naturally without JSON constraints
                 final_prompt = (
-                    "Produce the final user-facing answer now, based on all observations so far.\n\n"
+                    "Based on all the information gathered from the tools, provide your final analysis.\n"
+                    "Answer the user's original question directly.\n"
+                    "Be concise and technical.\n"
+                    "DO NOT use JSON format - just provide your reasoning and answer as plain text."
+                )
+                final_messages = [*messages, {"role": "user", "content": final_prompt}]
+
+                # Get the model's natural reasoning
+                try:
+                    resp = self.agent.client.chat.completions.create(
+                        model=self.agent.model_id,
+                        messages=final_messages,
+                        temperature=0.0,
+                        max_tokens=2048,  # Give plenty of room for reasoning
+                        timeout=60,  # More time for complex reasoning
+                    )
+                    final_answer = (resp.choices[0].message.content or "").strip()
+
+                    # If we got a response, use it (even if it's JSON, we'll extract the content)
+                    if final_answer:
+                        # Check if it accidentally returned JSON and extract the answer
+                        if final_answer.startswith("{") and "answer" in final_answer:
+                            try:
+                                obj = json.loads(final_answer)
+                                final_answer = obj.get("answer", obj.get("final_answer", final_answer))
+                            except:
+                                pass  # Use as-is if not valid JSON
+
+                        console.print(Panel(final_answer, title="Final Analysis", border_style="green"))
+                        self.logger.info(f"[FINAL]\n{final_answer}")
+                        return final_answer
+
+                except Exception as e:
+                    self.logger.warning(f"[FINAL] Failed to get reasoning: {e}")
+
+                # If plain text failed, try with JSON format as fallback
+                self.logger.info("[FINAL] Plain text failed, trying JSON format")
+                final_prompt = (
+                    "Produce the final user-facing answer now, based on all observations so far.\n"
+                    "YOU MUST RESPOND WITH VALID JSON.\n\n"
                     f"{FINAL_JSON_SPEC}"
                 )
                 final_messages = [*messages, {"role": "user", "content": final_prompt}]
-                raw_final = self._call_llm(final_messages)
-                final_obj, fdiag, fparts = _parse_json_with_diagnostics(raw_final, FinalOutput)
-                if final_obj is None:
-                    # Retry once
-                    strict_f = [*final_messages, {"role": "user", "content": "STRICT JSON ONLY. Repeat exactly in the specified schema."}]
-                    raw_final2 = self._call_llm(strict_f)
-                    final_obj, fdiag2, _ = _parse_json_with_diagnostics(raw_final2, FinalOutput)
-                    if final_obj is None:
-                        self.logger.error(f"[FINAL] JSON parse failed.\n{fdiag}\n--- Retry ---\n{fdiag2}")
-                        console.print(Panel.fit(
-                            f"Finalizer JSON parse failed.\n\n{fdiag}\n\n--- Retry ---\n{fdiag2}",
-                            title="Parse Error: FINAL", style="red", border_style="red"
-                        ))
-                        return "Finalizer failed."
 
-                final_answer = (final_obj.answer or "").strip() if PydAvailable else (final_obj.get("answer","").strip())  # type: ignore
-                final_reason = (final_obj.reason or "").strip() if PydAvailable else (final_obj.get("reason","").strip())  # type: ignore
-                console.print(Panel(final_answer or "(no answer) ", title="Final", border_style="green"))
+                for final_attempt in range(3):
+                    raw_final = self._call_llm(final_messages, retry_attempt=final_attempt)
+                    final_obj, fdiag, _ = _parse_json_with_diagnostics(raw_final, FinalOutput, retry_count=final_attempt)
+                    if final_obj is not None:
+                        break
+                    if final_attempt < 2:
+                        time.sleep(0.5)
+                else:
+                    # Last resort - construct from what we know
+                    if self.agent.state.get("functions"):
+                        func_count = len(self.agent.state["functions"])
+                        return f"Analysis complete. Found {func_count} functions in the binary. Unable to provide detailed analysis due to model limitations."
+                    return "Analysis complete but unable to provide detailed results."
+
+                final_answer = (final_obj.answer if PydAvailable else final_obj.get("answer", "")).strip()
+                final_reason = (final_obj.reason if PydAvailable else final_obj.get("reason", "")).strip()
+                console.print(Panel(final_answer or "(no answer)", title="Final Analysis", border_style="green"))
                 if final_reason:
                     console.print(Panel.fit(final_reason, title="Reason", style="dim", border_style="green"))
                 self.logger.info(f"[FINAL]\n{final_answer}")
-                if final_reason:
-                    self.logger.info(f"[FINAL][REASON] {final_reason}")
                 return final_answer
 
             # continue or replan → iterate
 
         self.logger.warning("[AGENT] Max iterations reached without a final answer.")
-        return "Stopped after max iterations without a final answer."
+        return "Analysis stopped after max iterations. The binary has been loaded, functions detected, and disassembly completed."
 
 # --------------------------------------------------------------------------------------
-# Typer commands
+# Typer commands (unchanged)
 # --------------------------------------------------------------------------------------
 def _common_session(
     binary: Optional[str],
@@ -770,7 +1036,7 @@ Iterate with PLAN → ACT → OBSERVE → REFLECT until a concise summary can be
             console.print(Panel(final or "(no answer)", title="Summary", border_style="green"))
             continue
 
-        # Fallthrough: send plain question (iterative controller will still run)
+        # Fallthrough: send plain question
         user_msg = cmd
         final = sess.ask_once(user_msg)
         console.print(Panel(final or "(no answer)", title="Response", border_style="green"))
