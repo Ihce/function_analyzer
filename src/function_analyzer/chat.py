@@ -19,7 +19,6 @@ from rich.syntax import Syntax
 from rich.text import Text
 
 from .agent import BinaryAnalysisAgent
-from ollama import Client as OllamaClient
 
 # Optional pydantic for schema validation (v1 or v2 supported, optional)
 try:
@@ -346,21 +345,20 @@ class Session:
         binary: Optional[str],
         boundary_ckpt: Optional[str],
         model_id: str,
-        ollama_url: str,
+        vllm_url: str,  # Renamed parameter
         verbose: bool,
         log_file: Optional[str],
         no_console: bool,
-        show_reasoning: bool = True,  # New parameter for showing reasoning
+        show_reasoning: bool = True,
     ) -> None:
-        # Always disable console logging - only log to file
         self.logger = _setup_logger("chat", log_file, verbose, to_console=False)
         self.agent = BinaryAnalysisAgent(
-            ollama_url=ollama_url,
+            vllm_url=vllm_url,  # Updated parameter name
             model_id=model_id,
             boundary_ckpt=boundary_ckpt or "models/function_boundary.pth",
             verbose=verbose,
             log_file=log_file,
-            log_to_console=False,  # Always False to prevent agent from logging to console
+            log_to_console=False,
         )
         self.system_prompt = SYSTEM_PROMPT
         self.binary_hint = binary
@@ -371,41 +369,35 @@ class Session:
         self.logger.info("=" * 80)
         self.logger.info(f"CHAT SESSION STARTED - {datetime.now()}")
         self.logger.info(f"Model: {model_id}")
-        self.logger.info(f"Ollama Host: {ollama_url.rsplit('/v1',1)[0] if '/v1' in ollama_url else ollama_url}")
+        self.logger.info(f"vLLM URL: {vllm_url}")
         self.logger.info(f"Binary hint: {binary or 'None'}")
         self.logger.info("=" * 80)
 
     def _call_llm(self, messages: list[dict[str, str]], json_mode: bool = False) -> str:
-        """LLM call with optional JSON mode for guaranteed valid JSON output."""
+        """LLM call optimized for vLLM."""
         try:
-            # Ensure Ollama options for large context and stable output
-            extra = {
-                "options": {
-                    "num_ctx": 131072,     # match your model's 131k window
-                    "num_predict": 2048,   # room for JSON outputs
-                    "temperature": 0.1,    # keep deterministic
-                }
+            params = {
+                "model": self.agent.model_id,
+                "messages": messages,
+                "temperature": 0.1,
+                "max_tokens": 2048,
+                "timeout": 60,  # vLLM is typically faster
             }
 
             if json_mode:
-                resp = self.agent.client.chat.completions.create(
-                    model=self.agent.model_id,
-                    messages=messages,
-                    temperature=0.1,
-                    max_tokens=2048,
-                    timeout=180,
-                    response_format={"type": "json_object"},  # OpenAI-compatible JSON mode (Ollama supports)
-                    extra_body=extra,
-                )
+                # Try JSON mode, fall back if not supported
+                try:
+                    params["response_format"] = {"type": "json_object"}
+                    resp = self.agent.client.chat.completions.create(**params)
+                except Exception as e:
+                    if "json" in str(e).lower() or "format" in str(e).lower():
+                        self.logger.warning("JSON mode not supported, using standard mode")
+                        params.pop("response_format", None)
+                        resp = self.agent.client.chat.completions.create(**params)
+                    else:
+                        raise
             else:
-                resp = self.agent.client.chat.completions.create(
-                    model=self.agent.model_id,
-                    messages=messages,
-                    temperature=0.1,
-                    max_tokens=2048,
-                    timeout=180,
-                    extra_body=extra,
-                )
+                resp = self.agent.client.chat.completions.create(**params)
 
             content = (resp.choices[0].message.content or "").strip()
 
@@ -417,22 +409,6 @@ class Session:
 
         except Exception as e:
             self.logger.error(f"[LLM Error]: {e}")
-            # Check if the error is about JSON mode not being supported
-            if "json" in str(e).lower() or "format" in str(e).lower():
-                self.logger.warning("[LLM] JSON mode not supported, falling back to standard mode")
-                # Retry without JSON mode
-                try:
-                    resp = self.agent.client.chat.completions.create(
-                        model=self.agent.model_id,
-                        messages=messages,
-                        temperature=0.1,
-                        max_tokens=2048,
-                        timeout=180,
-                        extra_body={"options": {"num_ctx": 131072, "num_predict": 2048, "temperature": 0.1}},
-                    )
-                    return (resp.choices[0].message.content or "").strip()
-                except Exception as e2:
-                    self.logger.error(f"[LLM Error on retry]: {e2}")
             return ""
 
     def _display_reasoning(self, stage: str, content: Dict[str, Any], iteration: int) -> str:
@@ -528,9 +504,9 @@ class Session:
 
             if not plan_obj:
                 self.logger.error(f"[PLAN] Failed to parse response")
-                error_msg = "[red]Failed to parse plan. Check if your Ollama version supports JSON mode.[/red]"
+                error_msg = "[red]Failed to parse plan. Check if your vLLM version supports JSON mode.[/red]"
                 console.print(Panel(error_msg, title=f"Iteration {iteration} - Error", border_style="red"))
-                return "Failed to parse plan. Consider updating Ollama or using a different model."
+                return "Failed to parse plan. Consider updating vLLM or using a different model."
 
             # Display planning with reasoning
             plan_display = self._display_reasoning("PLAN", plan_obj, iteration)
@@ -786,7 +762,7 @@ def _common_session(
     binary: Optional[str],
     boundary_ckpt: Optional[str],
     model_id: str,
-    ollama_url: str,
+    vllm_url: str,
     verbose: bool,
     log_dir: str,
     log_file: Optional[str],
@@ -794,22 +770,26 @@ def _common_session(
     show_reasoning: bool,
 ) -> Session:
     log_path = log_file or _default_log_path(log_dir)
-    return Session(binary, boundary_ckpt, model_id, ollama_url, verbose, log_path, no_console=True, show_reasoning=show_reasoning)
+    return Session(binary, boundary_ckpt, model_id, vllm_url, verbose, log_path, no_console, show_reasoning)
 
 @app.command(help="Analyze a binary and answer a question (iterative).")
 def ask(
     binary: str = typer.Argument(..., help="Path to the binary file"),
     question: str = typer.Argument(..., help="Question to answer about the binary"),
-    model_id: str = typer.Option("gpt-oss:20b", "--model-id", help="Model ID for Ollama"),
-    ollama_url: str = typer.Option("http://localhost:11434/v1", "--ollama-url", help="Ollama/OpenAI-compatible URL"),
-    boundary_ckpt: Optional[str] = typer.Option(None, "--boundary-ckpt", help="Path to boundary model checkpoint"),
+    model_id: str = typer.Option(None, "--model-id", help="Model ID (defaults to env or gpt-oss)"),
+    vllm_url: str = typer.Option(None, "--vllm-url", help="vLLM OpenAI-compatible URL"),
+    ollama_url: str = typer.Option(None, "--ollama-url", help="(Deprecated) Use --vllm-url"),
+    boundary_ckpt: Optional[str] = typer.Option(None, "--boundary-ckpt", help="Path to boundary model"),
     verbose: bool = typer.Option(False, "-v", "--verbose", help="Verbose logging"),
     log_dir: str = typer.Option("./logs", "--log-dir", help="Log directory"),
     log_file: Optional[str] = typer.Option(None, "--log-file", help="Custom log file path"),
-    no_console: bool = typer.Option(False, "--no-console", help="Disable console logging (deprecated)"),
     show_reasoning: bool = typer.Option(True, "--show-reasoning/--hide-reasoning", help="Show model reasoning"),
 ):
-    sess = _common_session(binary, boundary_ckpt, model_id, ollama_url, verbose, log_dir, log_file, no_console, show_reasoning)
+    # Handle backwards compatibility
+    url = vllm_url or ollama_url or os.getenv("VLLM_URL", "http://localhost:8000/v1")
+    model = model_id or os.getenv("MODEL_ID", "openai/gpt-oss-20b")
+
+    sess = _common_session(binary, boundary_ckpt, model, url, verbose, log_dir, log_file, True, show_reasoning)
     user_msg = f"""Target binary: {binary}
 
 Objective: {question}
@@ -822,16 +802,20 @@ Iterate with PLAN → ACT → OBSERVE → REFLECT until you can answer confident
 @app.command(help="Open a binary and summarize what it does (iterative).")
 def open(
     binary: str = typer.Argument(..., help="Path to the binary file"),
-    model_id: str = typer.Option("gpt-oss:20b", "--model-id"),
-    ollama_url: str = typer.Option("http://localhost:11434/v1", "--ollama-url"),
+    model_id: str = typer.Option(None, "--model-id", help="Model ID (defaults to env or gpt-oss)"),
+    vllm_url: str = typer.Option(None, "--vllm-url", help="vLLM OpenAI-compatible URL"),
+    ollama_url: str = typer.Option(None, "--ollama-url", help="(Deprecated) Use --vllm-url"),
     boundary_ckpt: Optional[str] = typer.Option(None, "--boundary-ckpt"),
     verbose: bool = typer.Option(False, "-v", "--verbose"),
     log_dir: str = typer.Option("./logs", "--log-dir"),
     log_file: Optional[str] = typer.Option(None, "--log-file"),
-    no_console: bool = typer.Option(False, "--no-console"),
     show_reasoning: bool = typer.Option(True, "--show-reasoning/--hide-reasoning"),
 ):
-    sess = _common_session(binary, boundary_ckpt, model_id, ollama_url, verbose, log_dir, log_file, no_console, show_reasoning)
+    # Handle backwards compatibility
+    url = vllm_url or ollama_url or os.getenv("VLLM_URL", "http://localhost:8000/v1")
+    model = model_id or os.getenv("MODEL_ID", "openai/gpt-oss-20b")
+
+    sess = _common_session(binary, boundary_ckpt, model, url, verbose, log_dir, log_file, True, show_reasoning)
     user_msg = f"""Target binary: {binary}
 
 Objective: Summarize what this program does.
@@ -843,15 +827,18 @@ Iterate with PLAN → ACT → OBSERVE → REFLECT until a concise summary can be
 
 @app.command(help="List available tools.")
 def tools(
-    model_id: str = typer.Option("gpt-oss:20b", "--model-id"),
-    ollama_url: str = typer.Option("http://localhost:11434/v1", "--ollama-url"),
+    model_id: str = typer.Option(None, "--model-id"),
+    vllm_url: str = typer.Option(None, "--vllm-url"),
+    ollama_url: str = typer.Option(None, "--ollama-url"),
     boundary_ckpt: Optional[str] = typer.Option(None, "--boundary-ckpt"),
     verbose: bool = typer.Option(False, "-v", "--verbose"),
     log_dir: str = typer.Option("./logs", "--log-dir"),
     log_file: Optional[str] = typer.Option(None, "--log-file"),
-    no_console: bool = typer.Option(False, "--no-console"),
 ):
-    sess = _common_session(None, boundary_ckpt, model_id, ollama_url, verbose, log_dir, log_file, no_console, True)
+    url = vllm_url or ollama_url or os.getenv("VLLM_URL", "http://localhost:8000/v1")
+    model = model_id or os.getenv("MODEL_ID", "openai/gpt-oss-20b")
+
+    sess = _common_session(None, boundary_ckpt, model, url, verbose, log_dir, log_file, True, True)
     table = Table(title="Available Tools", box=box.SIMPLE_HEAVY, show_lines=False)
     table.add_column("#", style="cyan", no_wrap=True)
     table.add_column("Name", style="bold")
@@ -863,17 +850,20 @@ def tools(
 
 @app.command(help="Interactive shell (iterative controller loop).")
 def repl(
-    model_id: str = typer.Option("gpt-oss:20b", "--model-id"),
-    ollama_url: str = typer.Option("http://localhost:11434/v1", "--ollama-url"),
+    model_id: str = typer.Option(None, "--model-id"),
+    vllm_url: str = typer.Option(None, "--vllm-url"),
+    ollama_url: str = typer.Option(None, "--ollama-url"),
     boundary_ckpt: Optional[str] = typer.Option(None, "--boundary-ckpt"),
     binary: Optional[str] = typer.Option(None, "--binary", help="Default binary hint"),
     verbose: bool = typer.Option(False, "-v", "--verbose"),
     log_dir: str = typer.Option("./logs", "--log-dir"),
     log_file: Optional[str] = typer.Option(None, "--log-file"),
-    no_console: bool = typer.Option(False, "--no-console"),
     show_reasoning: bool = typer.Option(True, "--show-reasoning/--hide-reasoning"),
 ):
-    sess = _common_session(binary, boundary_ckpt, model_id, ollama_url, verbose, log_dir, log_file, no_console, show_reasoning)
+    url = vllm_url or ollama_url or os.getenv("VLLM_URL", "http://localhost:8000/v1")
+    model = model_id or os.getenv("MODEL_ID", "openai/gpt-oss-20b")
+
+    sess = _common_session(binary, boundary_ckpt, model, url, verbose, log_dir, log_file, True, show_reasoning)
     console.print(Panel.fit("Commands: ask, open, tools, reset, verbose, reasoning, exit", title="REPL", style="magenta"))
 
     while True:

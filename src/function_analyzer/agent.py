@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-# agent.py — Orchestrates GPT-OSS (via Ollama) + your components tools using function-calling.
+# agent.py — Updated for vLLM with gpt-oss-20b
 
 import json
 import logging
+import os
 from typing import Any, Dict, Optional, Tuple, Type
 
 try:
-    from openai import OpenAI  # OpenAI Python SDK >= 1.x
+    from openai import OpenAI  # Using OpenAI client for vLLM compatibility
 except ImportError as e:
     raise SystemExit("Missing dependency: pip install openai>=1.0.0") from e
 
@@ -19,20 +20,28 @@ class BinaryAnalysisAgent:
     def __init__(
         self,
         *,
-        ollama_url: str = "http://localhost:11434/v1",
-        model_id: str = "gpt-oss:20b",
+        vllm_url: str = None,  # Renamed from ollama_url
+        model_id: str = None,
         boundary_ckpt: Optional[str] = None,
         logger: Optional[logging.Logger] = None,
         verbose: bool = True,
         log_file: Optional[str] = "agent_analysis.log",
         log_to_console: bool = True,
     ) -> None:
-        self.client = OpenAI(base_url=ollama_url, api_key="ollama")
-        self.model_id = model_id
+        # Use environment variables with proper defaults
+        self.base_url = vllm_url or os.getenv("VLLM_URL", "http://localhost:8000/v1")
+        self.model_id = model_id or os.getenv("MODEL_ID", "openai/gpt-oss-20b")
+
+        # vLLM uses OpenAI-compatible API
+        self.client = OpenAI(
+            base_url=self.base_url,
+            api_key=os.getenv("OPENAI_API_KEY", "dummy")  # vLLM doesn't validate keys
+        )
+
         self.boundary_ckpt = boundary_ckpt
         self.verbose = verbose
 
-        # Set up logging (existing code...)
+        # Set up logging
         self.log = logger or logging.getLogger("agent")
         if self.verbose:
             self.log.setLevel(logging.DEBUG)
@@ -42,7 +51,7 @@ class BinaryAnalysisAgent:
         # Clear existing handlers to avoid duplicates
         self.log.handlers = []
 
-        # Add handlers (existing code...)
+        # Add handlers
         if log_file:
             file_handler = logging.FileHandler(log_file, mode='a')
             file_handler.setFormatter(logging.Formatter(
@@ -51,8 +60,8 @@ class BinaryAnalysisAgent:
             ))
             self.log.addHandler(file_handler)
             self.log.info("="*80)
-            self.log.info(f"NEW ANALYSIS SESSION - Model: {model_id}")
-            self.log.info(f"Ollama URL: {ollama_url}")
+            self.log.info(f"NEW ANALYSIS SESSION - Model: {self.model_id}")
+            self.log.info(f"vLLM URL: {self.base_url}")
             self.log.info("="*80)
 
         if log_to_console:
@@ -65,7 +74,7 @@ class BinaryAnalysisAgent:
         self.boundaries = bd.BoundaryDetectorTool()
         self.disasm = dz.DisassemblerTool()
 
-        # Convert to OpenAI tools format
+        # vLLM uses 'tools' format (OpenAI compatible)
         self.tools = [
             {
                 "type": "function",
@@ -83,7 +92,7 @@ class BinaryAnalysisAgent:
 
         self.log.debug(f"Available tools: {[t['function']['name'] for t in self.tools]}")
 
-        # State and tool mapping (existing code...)
+        # State and tool mapping
         self.state: Dict[str, Any] = {
             "binary": None,
             "functions": None,
@@ -159,12 +168,11 @@ class BinaryAnalysisAgent:
         except Exception as e:
             return f"Failed to load boundary model: {e}"
 
-
     def _call_boundary_detector(
         self,
         *,
         model_path: Optional[str] = None,
-        **kwargs: Any,   # <-- accept min_function_size, merge_distance, resolve_overlaps, stride
+        **kwargs: Any,   # accept min_function_size, merge_distance, resolve_overlaps, stride
     ) -> str:
         self.log.info(f"[TOOL EXEC] boundary_detector")
 
@@ -205,7 +213,7 @@ class BinaryAnalysisAgent:
         text = np.asarray(self.state["binary"]["text_array"], dtype=np.uint8)
         base = int(self.state["binary"]["base_address"])
 
-        # Log config used (helps explain any future mismatches)
+        # Log config used
         self.log.debug(
             f"Running boundary detection on {len(text)} bytes, base=0x{base:08X}, "
             f"window_size={self.boundaries.window_size}, stride={self.boundaries.stride}, "
@@ -250,7 +258,6 @@ class BinaryAnalysisAgent:
             "examples": examples,
         }
         return json.dumps(success_msg)
-
 
     def _call_disassembler(self) -> str:
         self.log.info(f"[TOOL EXEC] disassembler")
@@ -334,7 +341,6 @@ class BinaryAnalysisAgent:
 
     def analyze(self, file_path: str, *, system_prompt: Optional[str] = None, max_iters: int = 8) -> str:
         import datetime
-        import os
 
         messages = [
             {"role": "system", "content": system_prompt or "You are a concise binary analyst."},
@@ -360,14 +366,16 @@ class BinaryAnalysisAgent:
                         content_preview = str(msg.get('content', ''))[:100]
                         self.log.debug(f"  Message {len(messages)-3+idx}: {role} - {content_preview}...")
 
-            # Make the API call
+            # Make the API call - vLLM format
             self.log.debug("[LLM] Sending request to model...")
             try:
                 resp = self.client.chat.completions.create(
                     model=self.model_id,
                     messages=messages,
-                    functions=self.functions,
-                    function_call="auto",
+                    tools=self.tools,  # vLLM uses 'tools'
+                    tool_choice="auto",
+                    temperature=0.1,
+                    max_tokens=2048,
                 )
                 msg = resp.choices[0].message
             except Exception as e:
@@ -377,49 +385,52 @@ class BinaryAnalysisAgent:
             # Log the full model response in verbose mode
             if self.verbose:
                 self.log.debug(f"[LLM RESPONSE] Content: {msg.content}")
-                if hasattr(msg, 'function_call') and msg.function_call:
-                    self.log.debug(f"[LLM RESPONSE] Function call: {msg.function_call.name}")
-                    self.log.debug(f"[LLM RESPONSE] Function args: {msg.function_call.arguments}")
+                if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                    self.log.debug(f"[LLM RESPONSE] Tool calls: {len(msg.tool_calls)}")
+                    for tool_call in msg.tool_calls:
+                        self.log.debug(f"  Tool: {tool_call.function.name}")
+                        self.log.debug(f"  Args: {tool_call.function.arguments}")
 
             # Log the model's reasoning/response
             if msg.content:
-                # Log full content to file, truncated to console
                 self.log.info(f"[LLM REASONING]\n{msg.content}")
 
-            # Check if model wants to call a tool
-            if getattr(msg, "function_call", None):
-                name = msg.function_call.name
-                raw = msg.function_call.arguments or "{}"
+            # Handle tool calls (vLLM format)
+            if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                # vLLM returns tool_calls array
+                for tool_call in msg.tool_calls:
+                    name = tool_call.function.name
+                    raw = tool_call.function.arguments or "{}"
 
-                self.log.info(f"[LLM DECISION] Model wants to call tool: {name}")
-                self.log.debug(f"[LLM DECISION] Tool arguments: {raw}")
+                    self.log.info(f"[LLM DECISION] Model wants to call tool: {name}")
+                    self.log.debug(f"[LLM DECISION] Tool arguments: {raw}")
 
-                try:
-                    parsed = json.loads(raw)
-                except Exception as e:
-                    self.log.error(f"[ERROR] Failed to parse tool arguments: {e}")
-                    parsed = {}
+                    try:
+                        parsed = json.loads(raw)
+                    except Exception as e:
+                        self.log.error(f"[ERROR] Failed to parse tool arguments: {e}")
+                        parsed = {}
 
-                # Auto-fill file_path for binary_loader if missing
-                if name == bl.BinaryLoaderTool.name and "file_path" not in parsed:
-                    self.log.debug(f"[AUTO-FILL] Adding file_path={path_hint} to binary_loader")
-                    parsed["file_path"] = path_hint
+                    # Auto-fill file_path for binary_loader if missing
+                    if name == bl.BinaryLoaderTool.name and "file_path" not in parsed:
+                        self.log.debug(f"[AUTO-FILL] Adding file_path={path_hint} to binary_loader")
+                        parsed["file_path"] = path_hint
 
-                func, ArgsModel = self._tools.get(name, (None, None))
-                if func is None:
-                    content = json.dumps({"error": f"Unknown tool: {name}"})
-                    self.log.error(f"[ERROR] Unknown tool requested: {name}")
-                else:
-                    kwargs, err = self._validate_args(parsed, ArgsModel)
-                    if err:
-                        content = json.dumps({"error": f"Invalid arguments: {err}"})
-                        self.log.error(f"[ERROR] Invalid tool arguments: {err}")
+                    func, ArgsModel = self._tools.get(name, (None, None))
+                    if func is None:
+                        content = json.dumps({"error": f"Unknown tool: {name}"})
+                        self.log.error(f"[ERROR] Unknown tool requested: {name}")
                     else:
-                        # Execute the tool
-                        content = func(**kwargs)  # type: ignore[arg-type]
+                        kwargs, err = self._validate_args(parsed, ArgsModel)
+                        if err:
+                            content = json.dumps({"error": f"Invalid arguments: {err}"})
+                            self.log.error(f"[ERROR] Invalid tool arguments: {err}")
+                        else:
+                            # Execute the tool
+                            content = func(**kwargs)  # type: ignore[arg-type]
 
-                # Add function result to messages
-                messages.append({"role": "function", "name": name, "content": content})
+                    # Add function result to messages
+                    messages.append({"role": "function", "name": name, "content": content})
                 continue
 
             # Final answer received (no more tools)

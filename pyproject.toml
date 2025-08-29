@@ -1,46 +1,50 @@
 [project]
 name = "function-analyzer"
 version = "0.1.0"
-description = "Agentic showcase for reverse engineering tasks using oss-gpt-20b"
+description = "Agentic showcase for reverse engineering tasks using gpt-oss-20b"
 readme = "README.md"
-requires-python = ">=3.10,<3.12"
+requires-python = ">=3.12,<3.13"
+
 dependencies = [
     "capstone>=5.0.6",
-    "mamba-ssm>=2.2.5",
+    # "mamba-ssm==2.2.5",
     "numpy>=2.2.6",
-    "ollama>=0.5.2",
     "openai>=1.100.0",
     "pefile>=2024.8.26",
     "pydantic>=2.11.7",
     "pyelftools>=0.32",
-    "torch>=2.0.0",
+    "torch==2.6.*",      # we'll bind this to the cu126 index below
     "typer>=0.16.1",
+    "rich>=13.0.0",
 ]
 
-
 [project.scripts]
-cli = "function_analyzer.main:main"
 chat = "function_analyzer.chat:main"
 
 [build-system]
-requires = ["setuptools>=68.0.0", "wheel"]
+requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
-[tool.ruff]
-line-length = 100
-target-version = "py39"
-select = ["E", "F", "I", "N", "W"]
-ignore = ["E501"]
+[tool.uv]
+index-strategy = "unsafe-best-match"
+# Build mamba-ssm in the project env so it can import torch/includes at build time.
+no-build-isolation-package = ["mamba-ssm"]
+# default-groups = ["dev"]  # Commented out or removed to avoid the errornc includes "dev" by default too. :contentReference[oaicite:1]{index=1}
 
-[tool.black]
-line-length = 100
-target-version = ["py39"]
+# Bind torch to the CUDA 12.6 wheel index so you don't need CLI flags.
+[tool.uv.sources]
+torch = { index = "torch-cu126" } # example of binding a dep to a named index. :contentReference[oaicite:2]{index=2}
 
-[tool.mypy]
-python_version = "3.10"
-warn_return_any = true
-warn_unused_configs = true
-ignore_missing_imports = true
+[[tool.uv.index]]
+name = "torch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true                                # only used when explicitly referenced. :contentReference[oaicite:3]{index=3}
+
+# (Optional) keep your gpt-oss wheels available
+[[tool.uv.index]]
+name = "vllm-oss"
+url = "https://wheels.vllm.ai/gpt-oss/"
+explicit = false

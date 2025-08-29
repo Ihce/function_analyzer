@@ -14,3 +14,4 @@ logs/
 models/
 models/function_boundary.pth
 *.pth
+.env
